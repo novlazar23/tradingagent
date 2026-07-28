@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from hashlib import sha256
+from itertools import islice
 from typing import overload
 
 from tradingagent.domain.models import Candle, Portfolio
@@ -31,6 +32,7 @@ class BacktestConfig:
     engine_version: str = "backtest-v1"
     strategy_version: str = "unspecified"
     strategy_configuration_json: str = "{}"
+    maximum_candles: int = 100_000
 
     def __post_init__(self) -> None:
         if self.initial_capital <= 0:
@@ -41,6 +43,8 @@ class BacktestConfig:
             raise ValueError("engine_version is required")
         if not self.strategy_version:
             raise ValueError("strategy_version is required")
+        if not 1 < self.maximum_candles <= 100_000:
+            raise ValueError("maximum_candles must be between 2 and 100000")
         try:
             parsed = json.loads(self.strategy_configuration_json)
         except json.JSONDecodeError as exc:
@@ -220,7 +224,11 @@ class BacktestEngine:
         The callback only receives candles whose close event has occurred.
         Orders it emits are queued until the following candle's open.
         """
-        bars = tuple(candles)
+        bars = tuple(islice(candles, self.config.maximum_candles + 1))
+        if len(bars) > self.config.maximum_candles:
+            raise ValueError(
+                f"backtest exceeds configured maximum_candles={self.config.maximum_candles}"
+            )
         self._validate_bars(bars)
         snapshot = self._snapshot(bars)
         ledger = AtomicLedger(Portfolio(self.config.initial_capital, ZERO))

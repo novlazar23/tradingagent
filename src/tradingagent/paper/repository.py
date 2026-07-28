@@ -158,10 +158,15 @@ class SQLAlchemyPaperRepository:
     """Map complete paper state to normalized records in one DB transaction."""
 
     def __init__(
-        self, engine: Engine, *, failure_injector: Callable[[str], None] | None = None
+        self,
+        engine: Engine,
+        *,
+        failure_injector: Callable[[str], None] | None = None,
+        transaction_guard: Callable[[Any], None] | None = None,
     ) -> None:
         self.sessions = sessionmaker(engine, expire_on_commit=False)
         self.failure_injector = failure_injector or (lambda _stage: None)
+        self.transaction_guard = transaction_guard or (lambda _session: None)
 
     def create_session(
         self,
@@ -186,6 +191,7 @@ class SQLAlchemyPaperRepository:
         )
         now = datetime.now(UTC)
         with self.sessions.begin() as db:
+            self.transaction_guard(db)
             paper = db.get(PaperSession, session_id)
             if paper is not None and "_state" in paper.request:
                 raise ValueError("session_id already exists")
@@ -322,6 +328,7 @@ class SQLAlchemyPaperRepository:
 
     def save(self, state: PaperSessionState) -> PaperSessionState:
         with self.sessions.begin() as db:
+            self.transaction_guard(db)
             self._save_state(db, state)
         return state
 
@@ -340,6 +347,7 @@ class SQLAlchemyPaperRepository:
         if checkpoint is None:
             raise ValueError("committed candle requires a checkpoint")
         with self.sessions.begin() as db:
+            self.transaction_guard(db)
             existing = db.scalar(
                 select(SignalDecisionRecord.id).where(
                     SignalDecisionRecord.paper_session_id == result.session.session_id,

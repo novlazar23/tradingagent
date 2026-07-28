@@ -1,6 +1,10 @@
+import resource
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from time import monotonic
+
+import pytest
 
 from tradingagent.backtest import BacktestConfig, BacktestEngine, BacktestOrderIntent
 from tradingagent.config import CostConfig
@@ -154,3 +158,44 @@ def test_strategy_history_is_a_constant_time_read_only_view() -> None:
     ).run(candles, strategy)  # type: ignore[arg-type]
 
     assert len({id(history) for history in histories}) == 1
+
+
+def test_rejects_input_beyond_the_configured_bound_without_exhausting_generator() -> None:
+    consumed = 0
+
+    def bars():
+        nonlocal consumed
+        for index in range(12):
+            consumed += 1
+            yield candle(index, o="100", h="101", low="99", close="100")
+
+    engine = BacktestEngine(
+        execution_model=ExecutionModel(costs()),
+        config=BacktestConfig(initial_capital=Decimal("1000"), maximum_candles=10),
+    )
+
+    with pytest.raises(ValueError, match="maximum_candles"):
+        engine.run(bars(), lambda *_: None)
+
+    assert consumed == 11
+
+
+def test_100_000_candle_memory_and_runtime_regression_gate() -> None:
+    count = 100_000
+    before_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    started = monotonic()
+    engine = BacktestEngine(
+        execution_model=ExecutionModel(costs()),
+        config=BacktestConfig(initial_capital=Decimal("1000"), maximum_candles=count),
+    )
+
+    result = engine.run(
+        (candle(index, o="100", h="101", low="99", close="100") for index in range(count)),
+        lambda *_: None,
+    )
+    elapsed = monotonic() - started
+    peak_growth_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before_kib
+
+    assert result.snapshot.candle_count == count
+    assert elapsed < 15
+    assert peak_growth_kib < 192 * 1024

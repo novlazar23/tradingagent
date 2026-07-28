@@ -19,8 +19,16 @@ x-app: &app
   volumes:
     - ${TRADINGAGENT_CONFIG_FILE:-./config.yaml}:/app/config/config.yaml:ro
   secrets:
-    - octobot_history_api_key
-    - postgres_password
+    - source: octobot_history_api_key
+      target: octobot_history_api_key
+      uid: "10001"
+      gid: "10001"
+      mode: 0400
+    - source: postgres_password
+      target: postgres_password
+      uid: "10001"
+      gid: "10001"
+      mode: 0400
   depends_on:
     postgres:
       condition: service_healthy
@@ -105,7 +113,11 @@ services:
       POSTGRES_USER: tradingagent
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     secrets:
-      - postgres_password
+      - source: postgres_password
+        target: postgres_password
+        uid: "70"
+        gid: "70"
+        mode: 0400
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U tradingagent -d tradingagent"]
       interval: 5s

@@ -74,7 +74,42 @@ jobs:
           chmod 600 "$DATABASE_PASSWORD_FILE"
           uv run alembic upgrade head
           uv run alembic current --check-heads
+      - name: Verify PostgreSQL rollback on injected transaction failure
+        run: |
+          uv run python - <<'PY'
+          from sqlalchemy import create_engine, select
+          from tradingagent.config import database_url_from_environment
+          from tradingagent.persistence.models import ConfigurationSnapshot
+
+          engine = create_engine(database_url_from_environment())
+          try:
+              with engine.begin() as connection:
+                  connection.execute(
+                      ConfigurationSnapshot.__table__.insert(),
+                      {
+                          "id": "ci-rollback-probe",
+                          "version_hash": "ci-rollback-probe",
+                          "payload": {},
+                          "created_at": __import__("datetime").datetime.now(
+                              __import__("datetime").UTC
+                          ),
+                      },
+                  )
+                  raise RuntimeError("injected transaction failure")
+          except RuntimeError:
+              pass
+          with engine.connect() as connection:
+              probe = connection.scalar(
+                  select(ConfigurationSnapshot.id).where(
+                      ConfigurationSnapshot.id == "ci-rollback-probe"
+                  )
+              )
+          assert probe is None, "failed transaction left partial durable state"
+          PY
           uv run alembic check
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+          uv run alembic current --check-heads
       - name: Verify schema and readiness
         run: |
           uv run python - <<'PY'
@@ -121,10 +156,12 @@ jobs:
           POSTGRES_PASSWORD_FILE: ${{ github.workspace }}/.ci-secrets/postgres
           TRADINGAGENT_CONFIG_FILE: ${{ github.workspace }}/.ci-config.yaml
         run: |
-          trap 'docker compose logs --no-color; docker compose down --volumes' EXIT
+          compose='docker compose -f compose.yaml -f compose.ci.yaml'
+          trap '$compose logs --no-color; $compose down --volumes' EXIT
           docker compose config --quiet
-          docker compose build api worker scheduler migrate
-          docker compose up --detach postgres migrate api worker scheduler
+          $compose config --quiet
+          $compose build api worker scheduler migrate
+          $compose up --detach history-stub history-proxy postgres migrate api worker
           for attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:8000/health/ready >/dev/null; then
               break
@@ -132,9 +169,8 @@ jobs:
             test "$attempt" -lt 30
             sleep 2
           done
-          docker compose exec -T postgres psql -U tradingagent -d tradingagent \
-            -c 'CREATE TABLE ci_persistence_probe (value integer NOT NULL); INSERT INTO ci_persistence_probe VALUES (1);'
-          docker compose restart postgres api worker scheduler
+          $compose exec -T api python /tmp/ci_compose_workflow.py exercise
+          $compose restart postgres api worker
           for attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:8000/health/ready >/dev/null; then
               break
@@ -142,8 +178,8 @@ jobs:
             test "$attempt" -lt 30
             sleep 2
           done
-          test "$(docker compose exec -T postgres psql -At -U tradingagent -d tradingagent \
-            -c 'SELECT value FROM ci_persistence_probe')" = "1"
+          $compose exec -T api python /tmp/ci_compose_workflow.py verify
+          $compose up --detach scheduler
 
   image-security:
     runs-on: ubuntu-latest
@@ -158,7 +194,6 @@ jobs:
           format: table
           exit-code: "1"
           severity: HIGH,CRITICAL
-          ignore-unfixed: true
       - name: Generate syft SBOM
         uses: anchore/sbom-action@v0
         with:

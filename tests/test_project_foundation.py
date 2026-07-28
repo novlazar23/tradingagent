@@ -67,7 +67,20 @@ def test_initial_migration_is_present() -> None:
     migrations = list((ROOT / "migrations" / "versions").glob("*.py"))
 
     assert len(migrations) == 1
-    assert "Base.metadata.create_all" in migrations[0].read_text()
+    source = migrations[0].read_text()
+    assert "op.create_table" in source
+    assert "op.create_index" in source
+    assert "Base" not in source
+    assert "tradingagent.persistence.models" not in source
+
+
+def test_compose_mounts_secrets_with_least_privilege_metadata() -> None:
+    compose = (ROOT / "compose.yaml").read_text()
+    assert "source: octobot_history_api_key" in compose
+    assert "source: postgres_password" in compose
+    assert 'uid: "10001"' in compose
+    assert 'uid: "70"' in compose
+    assert "mode: 0400" in compose
 
 
 def test_compose_renders_as_a_static_deployment_contract(tmp_path: Path) -> None:
@@ -139,5 +152,8 @@ def test_ci_gates_quality_contract_integration_security_and_sbom() -> None:
         "pip-audit",
         "trivy",
         "syft",
+        "alembic downgrade base",
+        "alembic upgrade head",
     ):
         assert gate in workflow
+    assert "ignore-unfixed" not in workflow

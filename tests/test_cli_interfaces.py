@@ -1,5 +1,8 @@
+from types import SimpleNamespace
+
 import pytest
 
+import tradingagent.cli as cli
 from tradingagent.cli import build_parser, main
 
 
@@ -16,6 +19,49 @@ def test_cli_exposes_required_commands(capsys: object) -> None:
 def test_cli_data_datasets_uses_application_service(capsys: object) -> None:
     assert main(["data", "datasets"]) == 0
     assert '"datasets": []' in capsys.readouterr().out  # type: ignore[attr-defined]
+
+
+def test_cli_data_sync_passes_required_dataset_to_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def create_job(kind: str, payload: dict[str, object]):
+        captured.update(kind=kind, payload=payload)
+        return {"id": "job"}
+
+    monkeypatch.setattr(cli.REGISTRY, "create_job", create_job)
+
+    assert main(["data", "sync", "--dataset-id", "btc"]) == 0
+    assert captured == {"kind": "data_sync", "payload": {"dataset_id": "btc"}}
+
+
+def test_scheduler_uses_typed_paper_poll_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[int] = []
+
+    class Scheduler:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def enqueue_due(self) -> None:
+            pass
+
+        def enqueue_data_syncs(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        cli,
+        "_runtime_config",
+        lambda: SimpleNamespace(deployment=SimpleNamespace(paper_poll_seconds=7)),
+    )
+    monkeypatch.setattr(cli, "JobScheduler", Scheduler)
+
+    def sleep(seconds: int) -> None:
+        sleeps.append(seconds)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", sleep)
+    with pytest.raises(KeyboardInterrupt):
+        main(["run-scheduler"])
+    assert sleeps == [7]
 
 
 def test_cli_paper_requires_explicit_subcommand() -> None:

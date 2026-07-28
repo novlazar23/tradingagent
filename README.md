@@ -11,7 +11,10 @@ Service und ein lokales Secret. Die Anwendungs-API wird ausschließlich an
 `127.0.0.1` veröffentlicht; PostgreSQL besitzt keinen Host-Port.
 
 ```bash
-export POSTGRES_PASSWORD='ein-langes-lokales-passwort'
+sudo install -d -m 0700 /opt/docker/stacks/tradingagent/secrets
+sudo install -m 0400 /dev/null /opt/docker/stacks/tradingagent/secrets/postgres_password
+sudo sh -c "printf '%s' 'ein-langes-lokales-passwort' > /opt/docker/stacks/tradingagent/secrets/postgres_password"
+export POSTGRES_PASSWORD_FILE=/opt/docker/stacks/tradingagent/secrets/postgres_password
 export OCTOBOT_HISTORY_API_KEY_FILE=/opt/docker/stacks/octobot/secrets/history_api_key
 docker compose up --build -d
 docker compose ps

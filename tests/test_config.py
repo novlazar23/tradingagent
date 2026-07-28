@@ -13,6 +13,7 @@ def valid_config() -> dict[str, object]:
             "history_base_url": "http://192.168.178.20:5002",
             "history_api_key_file": "/run/secrets/octobot_history_api_key",
             "history_page_limit": 500,
+            "backtest_max_candles": 100_000,
             "paper_poll_seconds": 30,
             "paper_max_candle_age_seconds": 1200,
         },
@@ -59,6 +60,14 @@ def valid_config() -> dict[str, object]:
 def test_history_page_limit_is_capped_at_upstream_contract() -> None:
     payload = valid_config()
     payload["deployment"]["history_page_limit"] = 501  # type: ignore[index]
+
+    with pytest.raises(ValidationError):
+        AppConfig.model_validate(payload)
+
+
+def test_backtest_size_limit_is_explicit_and_bounded() -> None:
+    payload = valid_config()
+    payload["deployment"]["backtest_max_candles"] = 100_001  # type: ignore[index]
 
     with pytest.raises(ValidationError):
         AppConfig.model_validate(payload)

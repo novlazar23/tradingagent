@@ -2,6 +2,7 @@ deployment:
   history_base_url: "http://history-proxy:8080"
   history_api_key_file: "/run/secrets/octobot_history_api_key"
   history_page_limit: 500
+  backtest_max_candles: 100000
   paper_poll_seconds: 30
   paper_max_candle_age_seconds: 1200
 costs:

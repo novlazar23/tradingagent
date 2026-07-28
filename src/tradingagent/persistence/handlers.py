@@ -2,6 +2,7 @@
 
 import json
 import uuid
+from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
@@ -10,6 +11,7 @@ from hashlib import sha256
 from typing import Literal, cast
 
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from tradingagent.api.services import ApplicationRegistry
 from tradingagent.backtest import BacktestConfig, BacktestEngine
@@ -44,9 +46,19 @@ from tradingagent.trading.strategy import (
     StrategyRequest,
 )
 
+_FEATURE_LOOKBACK_CANDLES = 500
+_TIMEFRAME_MINUTES = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+
 
 def _json(value: object) -> object:
     return json.loads(json.dumps(value, default=str))
+
+
+def _fence(progress: Callable[[int], None], session: Session) -> None:
+    """Fence a production job transaction when progress carries a claim token."""
+    fence = getattr(progress, "fence", None)
+    if callable(fence):
+        fence(session)
 
 
 class RuntimeHandlerFactory:
@@ -88,6 +100,12 @@ class RuntimeHandlerFactory:
             external_id = dataset.external_id
         start = datetime.fromisoformat(str(payload.get("start") or metadata["start"]))
         end = datetime.fromisoformat(str(payload.get("end") or metadata["end"]))
+        requested_execution_candles = int((end - start).total_seconds() // (15 * 60))
+        if requested_execution_candles > self.config.deployment.backtest_max_candles:
+            raise ValueError(
+                "data sync range exceeds configured backtest_max_candles="
+                f"{self.config.deployment.backtest_max_candles}"
+            )
         inserted = revised = 0
         for timeframe_value in ("15m", "1h", "4h", "1d"):
             timeframe = parse_timeframe(timeframe_value)
@@ -103,6 +121,7 @@ class RuntimeHandlerFactory:
                 )
             )
             with self.registry.sessions.begin() as db:
+                _fence(progress, db)
                 for candle in candles:
                     existing = db.scalar(
                         select(CandleRecord).where(
@@ -169,20 +188,36 @@ class RuntimeHandlerFactory:
         resolved = self.snapshots.get(fingerprint, code_version=self.code_version)
         dataset_id = str(payload["dataset_id"])
         with self.registry.sessions.begin() as db:
+            _fence(progress, db)
             run = db.get(BacktestRun, run_id)
             if run is None:
                 raise ValueError("unknown backtest")
             run.state = "running"
-            rows = db.scalars(
-                select(CandleRecord)
-                .where(
-                    CandleRecord.dataset_id == dataset_id,
-                    CandleRecord.is_closed.is_(True),
+            rows: list[CandleRecord] = []
+            for timeframe in ("15m", "1h", "4h", "1d"):
+                maximum = (
+                    self.config.deployment.backtest_max_candles
+                    * 15
+                    // _TIMEFRAME_MINUTES[timeframe]
                 )
-                .order_by(CandleRecord.close_time)
-            ).all()
+                timeframe_rows = db.scalars(
+                    select(CandleRecord)
+                    .where(
+                        CandleRecord.dataset_id == dataset_id,
+                        CandleRecord.timeframe == timeframe,
+                        CandleRecord.is_closed.is_(True),
+                    )
+                    .order_by(CandleRecord.close_time)
+                    .limit(maximum + 1)
+                ).all()
+                if len(timeframe_rows) > maximum:
+                    raise ValueError(
+                        f"backtest exceeds configured candle bound for {timeframe}: {maximum}"
+                    )
+                rows.extend(timeframe_rows)
             gaps = db.scalars(select(DataGap).where(DataGap.dataset_id == dataset_id)).all()
         candles_by_timeframe = _rows_by_timeframe(rows)
+        candle_ids = _candle_ids(rows)
         candles = candles_by_timeframe["15m"]
         source_data_fingerprint = _data_fingerprint(rows)
         if len(candles) < 2:
@@ -202,6 +237,7 @@ class RuntimeHandlerFactory:
                 strategy_configuration_json=json.dumps(
                     resolved.configuration.strategy.model_dump(mode="json"), sort_keys=True
                 ),
+                maximum_candles=self.config.deployment.backtest_max_candles,
             ),
             pipeline=pipeline,
         )
@@ -211,6 +247,7 @@ class RuntimeHandlerFactory:
                 strategy=resolved.configuration.strategy,
                 candles_by_timeframe=candles_by_timeframe,
                 rows=rows,
+                candle_ids=candle_ids,
                 decision_time=history[-1].close_time,
                 has_position=position,
                 gaps=gaps,
@@ -219,6 +256,7 @@ class RuntimeHandlerFactory:
         progress(80)
         serialized = _json(asdict(report))
         with self.registry.sessions.begin() as db:
+            _fence(progress, db)
             run = db.get(BacktestRun, run_id)
             assert run is not None
             run.state = "completed"
@@ -267,7 +305,11 @@ class RuntimeHandlerFactory:
         resolved = self.snapshots.get(
             str(payload["configuration_version"]), code_version=self.code_version
         )
-        self.paper_repository.create_session(
+        repository = SQLAlchemyPaperRepository(
+            self.registry.engine,
+            transaction_guard=lambda db: _fence(progress, db),
+        )
+        repository.create_session(
             session_id=session_id,
             portfolio=Portfolio(resolved.configuration.risk.initial_capital, Decimal(0)),
             risk_state=SessionRiskState.initial(resolved.configuration.risk.initial_capital),
@@ -284,7 +326,11 @@ class RuntimeHandlerFactory:
         self, payload: dict[str, object], progress: Callable[[int], None]
     ) -> dict[str, object]:
         session_id = str(payload["session_id"])
-        state = self.paper_repository.get(session_id)
+        repository = SQLAlchemyPaperRepository(
+            self.registry.engine,
+            transaction_guard=lambda db: _fence(progress, db),
+        )
+        state = repository.get(session_id)
         snapshot_id = state.configuration_versions[1]
         with self.registry.sessions() as db:
             snapshot = db.get(
@@ -311,64 +357,80 @@ class RuntimeHandlerFactory:
                 .order_by(CandleRecord.close_time)
             ).all()
             gaps = db.scalars(select(DataGap).where(DataGap.dataset_id == dataset_id)).all()
-        candles_by_timeframe = _rows_by_timeframe(rows)
-        execution_rows = [row for row in rows if row.timeframe == "15m"]
-        candle = execution_rows[-1] if execution_rows else None
-        if candle is None:
-            raise ValueError("no closed 15m candle available")
         resolved = self.snapshots.resolve(snapshot.payload, code_version=self.code_version)
-        decision_time = _aware(candle.close_time)
-        request = _strategy_request(
-            strategy=resolved.configuration.strategy,
-            candles_by_timeframe=candles_by_timeframe,
-            rows=rows,
-            decision_time=decision_time,
-            has_position=state.ledger.portfolio.btc > 0,
-            gaps=gaps,
-        )
-        matching_gap = any(
-            _aware(gap.start_time) < decision_time and _aware(gap.end_time) <= decision_time
-            for gap in gaps
-        )
-        source_available = all(
-            any(candle.close_time <= decision_time for candle in candles_by_timeframe[tf])
-            for tf in ("15m", "1h", "4h", "1d")
-        )
-        observed_at = datetime.now(UTC)
-        clock_drift = observed_at < decision_time
-        portfolio = state.ledger.portfolio
-        ledger_consistent = portfolio.cash >= 0 and portfolio.btc >= 0
-        engine = self._paper_engine(resolved)
-        result = engine.process(
-            session_id,
-            PaperCycle(
-                candle_id=candle.id,
-                candle_close_time=decision_time,
-                observed_at=observed_at,
-                candle_open=candle.open,
-                reference_price=candle.close,
-                candle_low=candle.low,
-                candle_high=candle.high,
-                atr=_latest_atr(
-                    candles_by_timeframe["15m"],
-                    resolved.configuration.strategy.indicator_parameters,
+        engine = self._paper_engine(resolved, repository=repository)
+        checkpoint_time = state.checkpoint.candle_close_time if state.checkpoint else None
+        execution_rows = _paper_execution_rows(rows, checkpoint_time)
+        if not execution_rows:
+            progress(100)
+            return {
+                "paper_session_id": session_id,
+                "state": state.status.value.lower(),
+                "processed_candles": 0,
+            }
+        result = state
+        for index, candle in enumerate(execution_rows, start=1):
+            decision_time = _aware(candle.close_time)
+            visible_rows = [row for row in rows if _aware(row.close_time) <= decision_time]
+            candles_by_timeframe = _rows_by_timeframe(visible_rows)
+            request = _strategy_request(
+                strategy=resolved.configuration.strategy,
+                candles_by_timeframe=candles_by_timeframe,
+                rows=visible_rows,
+                decision_time=decision_time,
+                has_position=result.ledger.portfolio.btc > 0,
+                gaps=gaps,
+            )
+            matching_gap = any(
+                _aware(gap.start_time) < decision_time and _aware(gap.end_time) <= decision_time
+                for gap in gaps
+            )
+            source_available = all(
+                any(_aware(row.close_time) <= decision_time for row in candles_by_timeframe[tf])
+                for tf in ("15m", "1h", "4h", "1d")
+            )
+            portfolio = result.ledger.portfolio
+            result = engine.process(
+                session_id,
+                PaperCycle(
+                    candle_id=candle.id,
+                    candle_close_time=decision_time,
+                    # A catch-up cycle recreates the decision at candle close. Using
+                    # wall time would incorrectly reject all downtime candles as stale.
+                    observed_at=decision_time,
+                    candle_open=candle.open,
+                    reference_price=candle.close,
+                    candle_low=candle.low,
+                    candle_high=candle.high,
+                    atr=_latest_atr(
+                        candles_by_timeframe["15m"],
+                        resolved.configuration.strategy.indicator_parameters,
+                    ),
+                    strategy_request=request,
+                    health=CandleHealth(
+                        source_available,
+                        matching_gap,
+                        False,
+                        portfolio.cash >= 0 and portfolio.btc >= 0,
+                    ),
                 ),
-                strategy_request=request,
-                health=CandleHealth(
-                    source_available,
-                    matching_gap,
-                    clock_drift,
-                    ledger_consistent,
-                ),
-            ),
-        )
-        progress(100)
-        return {"paper_session_id": session_id, "state": result.status.value.lower()}
+            )
+            progress(index * 100 // len(execution_rows))
+        return {
+            "paper_session_id": session_id,
+            "state": result.status.value.lower(),
+            "processed_candles": len(execution_rows),
+        }
 
-    def _paper_engine(self, resolved: ResolvedSnapshot) -> PaperEngine:
+    def _paper_engine(
+        self,
+        resolved: ResolvedSnapshot,
+        *,
+        repository: SQLAlchemyPaperRepository | None = None,
+    ) -> PaperEngine:
         configuration = resolved.configuration
         return PaperEngine(
-            repository=self.paper_repository,
+            repository=repository or self.paper_repository,
             strategy=StrategyEngine(),
             risk=RiskEngine(configuration.risk),
             execution=ExecutionModel(configuration.costs),
@@ -449,11 +511,29 @@ def _rows_by_timeframe(
     }
 
 
+def _paper_execution_rows(
+    rows: Sequence[CandleRecord], checkpoint_close: datetime | None
+) -> list[CandleRecord]:
+    """Return closed 15m candles strictly after a durable checkpoint."""
+    checkpoint = _aware(checkpoint_close) if checkpoint_close is not None else None
+    return sorted(
+        (
+            row
+            for row in rows
+            if row.timeframe == "15m"
+            and row.is_closed
+            and (checkpoint is None or _aware(row.close_time) > checkpoint)
+        ),
+        key=lambda row: (_aware(row.close_time), row.id),
+    )
+
+
 def _strategy_request(
     *,
     strategy: StrategyConfig,
     candles_by_timeframe: Mapping[str, tuple[Candle, ...]],
     rows: Sequence[CandleRecord],
+    candle_ids: Mapping[tuple[str, datetime], str] | None = None,
     decision_time: datetime,
     has_position: bool,
     gaps: Sequence[DataGap],
@@ -463,11 +543,7 @@ def _strategy_request(
     pattern_parameters = strategy.pattern_parameters
     indicator_config = _indicator_config(indicator_parameters)
     pattern_engine = PatternEngine(_pattern_config(pattern_parameters))
-    ids = {
-        (row.timeframe, _aware(row.close_time)): row.id
-        for row in rows
-        if row.is_closed and _aware(row.close_time) <= decision_time
-    }
+    ids = candle_ids if candle_ids is not None else _candle_ids(rows)
     contributions: list[SignalContribution] = []
     blockers: list[str] = []
     indicator_groups = {
@@ -480,11 +556,11 @@ def _strategy_request(
         "volume": "volume",
     }
     for timeframe in ("15m", "1h", "4h", "1d"):
-        visible = tuple(
-            candle
-            for candle in candles_by_timeframe[timeframe]
-            if candle.close_time <= decision_time
+        timeframe_candles = candles_by_timeframe[timeframe]
+        visible_end = bisect_right(
+            timeframe_candles, decision_time, key=lambda candle: candle.close_time
         )
+        visible = timeframe_candles[max(0, visible_end - _FEATURE_LOOKBACK_CANDLES) : visible_end]
         if not visible:
             blockers.append(f"missing closed {timeframe} candle")
             continue
@@ -560,9 +636,14 @@ def _latest_atr(candles: tuple[Candle, ...], parameters: Mapping[str, Decimal]) 
     return calculate_indicators(candles, _indicator_config(parameters)).atr
 
 
+def _candle_ids(rows: Sequence[CandleRecord]) -> dict[tuple[str, datetime], str]:
+    return {(row.timeframe, _aware(row.close_time)): row.id for row in rows if row.is_closed}
+
+
 def _data_fingerprint(rows: Sequence[CandleRecord]) -> str:
-    payload = [
-        (
+    hasher = sha256()
+    for row in sorted(rows, key=lambda item: (item.timeframe, _aware(item.open_time))):
+        payload = (
             row.source,
             row.dataset_id,
             row.symbol,
@@ -570,9 +651,9 @@ def _data_fingerprint(rows: Sequence[CandleRecord]) -> str:
             _aware(row.open_time).isoformat(),
             row.source_fingerprint,
         )
-        for row in sorted(rows, key=lambda item: (item.timeframe, _aware(item.open_time)))
-    ]
-    return sha256(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
+        hasher.update(json.dumps(payload, separators=(",", ":")).encode())
+        hasher.update(b"\n")
+    return hasher.hexdigest()
 
 
 def _candle_values(candle: Candle, dataset_id: str) -> dict[str, object]:

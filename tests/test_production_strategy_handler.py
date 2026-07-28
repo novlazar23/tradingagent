@@ -5,7 +5,7 @@ from typing import Literal
 from tradingagent.backtest import BacktestConfig, BacktestEngine
 from tradingagent.config import CostConfig, RiskConfig, StrategyConfig
 from tradingagent.domain import Candle
-from tradingagent.persistence.handlers import _strategy_request
+from tradingagent.persistence.handlers import _paper_execution_rows, _strategy_request
 from tradingagent.persistence.models import CandleRecord, DataGap
 from tradingagent.trading import ExecutionModel, RiskEngine, StrategyEngine, TradingPipeline
 
@@ -185,3 +185,18 @@ def test_production_request_fails_closed_when_persisted_gap_is_visible() -> None
         f"data gap 1h {(decision_time - timedelta(hours=2)).isoformat()}",
     )
     assert decision.action.value == "BLOCKED"
+
+
+def test_paper_execution_rows_are_every_successor_after_checkpoint_in_order() -> None:
+    rows = records({"15m": candles("15m", 5)})
+    checkpoint_close = rows[1].close_time
+
+    pending = _paper_execution_rows(rows, checkpoint_close)
+
+    assert [row.id for row in pending] == ["15m-2", "15m-3", "15m-4"]
+
+
+def test_paper_execution_rows_are_empty_when_checkpoint_is_caught_up() -> None:
+    rows = records({"15m": candles("15m", 3)})
+
+    assert _paper_execution_rows(rows, rows[-1].close_time) == []

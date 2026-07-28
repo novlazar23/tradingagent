@@ -1,0 +1,18 @@
+services:
+  api:
+    volumes:
+      - ./infra/ci_compose_workflow.py:/tmp/ci_compose_workflow.py:ro
+
+  history-stub:
+    image: python:3.12-alpine
+    command: ["python", "/stub/ci_history_stub.py"]
+    volumes:
+      - ./infra/ci_history_stub.py:/stub/ci_history_stub.py:ro
+    networks:
+      - history-egress
+
+  history-proxy:
+    volumes:
+      - ./infra/ci-history-proxy.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - history-stub

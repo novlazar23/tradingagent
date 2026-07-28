@@ -5,6 +5,7 @@ import json
 import threading
 import uuid
 from base64 import urlsafe_b64decode, urlsafe_b64encode
+from contextvars import ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Literal, Protocol
@@ -13,7 +14,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import Engine, create_engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from tradingagent.api.models import AcceptedOperation, JobView, ResourceView
@@ -102,6 +103,9 @@ class ApplicationRegistry:
         self.configuration_ready = configuration_ready
         self.history_ready = history_ready
         self._idempotency_lock = threading.RLock()
+        self._write_session: ContextVar[Session | None] = ContextVar(
+            f"registry_write_session_{id(self)}", default=None
+        )
 
     @classmethod
     def from_database_url(
@@ -202,7 +206,7 @@ class ApplicationRegistry:
         if not callable(factory):
             raise TypeError("factory must be callable")
         with self._idempotency_lock:
-            with self.sessions() as session:
+            with self.sessions.begin() as session:
                 previous = session.scalar(
                     select(IdempotencyRecord).where(
                         IdempotencyRecord.operation == operation,
@@ -217,12 +221,17 @@ class ApplicationRegistry:
                             409,
                         )
                     return self._restore(previous.result_type, previous.result)
-            result = factory()
-            result_type = type(result).__name__
-            serialized = (
-                result.model_dump(mode="json") if hasattr(result, "model_dump") else dict(result)
-            )
-            with self.sessions.begin() as session:
+                token = self._write_session.set(session)
+                try:
+                    result = factory()
+                finally:
+                    self._write_session.reset(token)
+                result_type = type(result).__name__
+                serialized = (
+                    result.model_dump(mode="json")
+                    if hasattr(result, "model_dump")
+                    else dict(result)
+                )
                 session.add(
                     IdempotencyRecord(
                         id=str(uuid.uuid4()),
@@ -240,54 +249,70 @@ class ApplicationRegistry:
                     raise ApplicationError(
                         "idempotency_conflict", "Concurrent request conflict", 409
                     ) from exc
-            return result
+                session.flush()
+                return result
 
     def create(self, kind: str, payload: dict[str, object]) -> AcceptedOperation:
         resource_id, job_id = str(uuid.uuid4()), str(uuid.uuid4())
         now = _utcnow()
-        with self.sessions.begin() as session:
-            if kind == "backtest":
-                session.add(
-                    BacktestRun(
-                        id=resource_id,
-                        state="queued",
-                        request=payload,
-                        result=None,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-            else:
-                session.add(
-                    PaperSession(
-                        id=resource_id,
-                        state="created",
-                        request=payload,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-            session.add(
-                JobRecord(
-                    id=job_id,
-                    kind=f"{kind}_create",
-                    status="queued",
-                    progress=0,
-                    retry_count=0,
-                    maximum_retries=3,
-                    payload={"resource_id": resource_id, **payload},
-                    idempotency_key=f"resource:{resource_id}",
-                    available_at=now,
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
+        active = self._write_session.get()
+        if active is not None:
+            self._create_records(active, kind, payload, resource_id, job_id, now)
+        else:
+            with self.sessions.begin() as session:
+                self._create_records(session, kind, payload, resource_id, job_id, now)
         base = "/api/v1/backtests" if kind == "backtest" else "/api/v1/paper-sessions"
         return AcceptedOperation(
             resource_id=resource_id,
             resource_url=f"{base}/{resource_id}",
             job_id=job_id,
             job_url=f"/api/v1/jobs/{job_id}",
+        )
+
+    @staticmethod
+    def _create_records(
+        session: Session,
+        kind: str,
+        payload: dict[str, object],
+        resource_id: str,
+        job_id: str,
+        now: datetime,
+    ) -> None:
+        if kind == "backtest":
+            session.add(
+                BacktestRun(
+                    id=resource_id,
+                    state="queued",
+                    request=payload,
+                    result=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        else:
+            session.add(
+                PaperSession(
+                    id=resource_id,
+                    state="created",
+                    request=payload,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        session.add(
+            JobRecord(
+                id=job_id,
+                kind=f"{kind}_create",
+                status="queued",
+                progress=0,
+                retry_count=0,
+                maximum_retries=3,
+                payload={"resource_id": resource_id, **payload},
+                idempotency_key=f"resource:{resource_id}",
+                available_at=now,
+                created_at=now,
+                updated_at=now,
+            )
         )
 
     def create_job(
@@ -299,30 +324,44 @@ class ApplicationRegistry:
     ) -> JobView:
         now, job_id = _utcnow(), str(uuid.uuid4())
         operation_key = idempotency_key or job_id
+        active = self._write_session.get()
+        if active is not None:
+            return self._create_job_record(active, kind, payload, operation_key, job_id, now)
         with self.sessions.begin() as session:
-            existing = session.scalar(
-                select(JobRecord).where(
-                    JobRecord.kind == kind,
-                    JobRecord.idempotency_key == operation_key,
-                )
+            return self._create_job_record(session, kind, payload, operation_key, job_id, now)
+
+    def _create_job_record(
+        self,
+        session: Session,
+        kind: str,
+        payload: dict[str, object] | None,
+        operation_key: str,
+        job_id: str,
+        now: datetime,
+    ) -> JobView:
+        existing = session.scalar(
+            select(JobRecord).where(
+                JobRecord.kind == kind,
+                JobRecord.idempotency_key == operation_key,
             )
-            if existing is not None:
-                return self._job_view(existing)
-            record = JobRecord(
-                id=job_id,
-                kind=kind,
-                status="queued",
-                progress=0,
-                retry_count=0,
-                maximum_retries=3,
-                payload=payload or {},
-                idempotency_key=operation_key,
-                available_at=now,
-                created_at=now,
-                updated_at=now,
-            )
-            session.add(record)
-            session.flush()
+        )
+        if existing is not None:
+            return self._job_view(existing)
+        record = JobRecord(
+            id=job_id,
+            kind=kind,
+            status="queued",
+            progress=0,
+            retry_count=0,
+            maximum_retries=3,
+            payload=payload or {},
+            idempotency_key=operation_key,
+            available_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(record)
+        session.flush()
         return self._job_view(record)
 
     @staticmethod

@@ -21,6 +21,7 @@ class DeploymentConfig(StrictConfigModel):
     history_base_url: AnyHttpUrl
     history_api_key_file: str = Field(min_length=1)
     history_page_limit: int = Field(gt=0, le=500)
+    backtest_max_candles: int = Field(gt=1, le=100_000)
     paper_poll_seconds: int = Field(gt=0)
     paper_max_candle_age_seconds: int = Field(gt=0)
 

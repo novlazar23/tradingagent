@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import or_, select
+from sqlalchemy.orm import Session
 
 from tradingagent.api.services import ApplicationRegistry
 from tradingagent.persistence.models import JobRecord, MarketDataset, PaperSession
@@ -20,6 +21,46 @@ class RetryableJobError(RuntimeError):
 
 class LostJobLeaseError(RuntimeError):
     """The worker is fenced because another owner now holds the lease."""
+
+
+class JobProgress:
+    """Progress heartbeat carrying the immutable claim fencing token."""
+
+    def __init__(
+        self,
+        worker: "DurableJobWorker",
+        job_id: str,
+        generation: int,
+        heartbeat_now: Callable[[], datetime],
+    ) -> None:
+        self.worker = worker
+        self.job_id = job_id
+        self.generation = generation
+        self.heartbeat_now = heartbeat_now
+
+    def fence(self, session: Session) -> None:
+        record = session.get(JobRecord, self.job_id)
+        now = self.heartbeat_now()
+        if (
+            record is None
+            or record.status != "running"
+            or record.lease_owner != self.worker.worker_id
+            or record.claim_generation != self.generation
+            or self.worker._lease_expired(record, now)
+        ):
+            raise LostJobLeaseError(f"job lease lost: {self.job_id}")
+
+    def __call__(self, value: int) -> None:
+        if not 0 <= value <= 100:
+            raise ValueError("progress must be between 0 and 100")
+        with self.worker.registry.sessions.begin() as session:
+            self.fence(session)
+            record = session.get(JobRecord, self.job_id)
+            assert record is not None
+            renewed_at = self.heartbeat_now()
+            record.progress = value
+            record.lease_expires_at = renewed_at + self.worker.lease_duration
+            record.updated_at = renewed_at
 
 
 class DurableJobWorker:
@@ -65,6 +106,7 @@ class DurableJobWorker:
             if job is None:
                 return False
             job.status = "running"
+            job.claim_generation += 1
             job.claimed_at = current
             job.lease_owner = self.worker_id
             job.lease_expires_at = current + self.lease_duration
@@ -72,28 +114,14 @@ class DurableJobWorker:
             job_id = job.id
             kind = job.kind
             payload = job.payload
+            claim_generation = job.claim_generation
 
         handler = self.handlers.get(kind)
         if handler is None:
             self._fail(job_id, RuntimeError(f"no handler registered for {kind}"), current)
             return True
 
-        def progress(value: int) -> None:
-            if not 0 <= value <= 100:
-                raise ValueError("progress must be between 0 and 100")
-            with self.registry.sessions.begin() as session:
-                record = session.get(JobRecord, job_id)
-                renewed_at = heartbeat_now()
-                if (
-                    record is None
-                    or record.status != "running"
-                    or record.lease_owner != self.worker_id
-                    or self._lease_expired(record, renewed_at)
-                ):
-                    raise LostJobLeaseError(f"job lease lost: {job_id}")
-                record.progress = value
-                record.lease_expires_at = renewed_at + self.lease_duration
-                record.updated_at = renewed_at
+        progress = JobProgress(self, job_id, claim_generation, heartbeat_now)
 
         try:
             for attempt in range(self.maximum_retries + 1):

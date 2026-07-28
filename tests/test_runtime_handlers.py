@@ -10,7 +10,7 @@ from tradingagent.domain.models import Portfolio
 from tradingagent.paper.engine import PaperEngine
 from tradingagent.paper.repository import SQLAlchemyPaperRepository
 from tradingagent.persistence.models import Base, JobRecord, PaperSession
-from tradingagent.persistence.runtime import DurableJobWorker, RetryableJobError
+from tradingagent.persistence.runtime import DurableJobWorker, LostJobLeaseError, RetryableJobError
 from tradingagent.persistence.snapshots import SnapshotResolver
 from tradingagent.trading.execution import ExecutionModel
 from tradingagent.trading.risk import RiskEngine, SessionRiskState
@@ -150,6 +150,32 @@ def test_progress_renews_lease_and_rejects_a_worker_that_lost_ownership() -> Non
         assert row is not None
         assert row.lease_owner == "replacement"
         assert row.status == "running"
+
+
+def test_reclaimed_job_fences_stale_handler_side_effect_transaction() -> None:
+    engine = database()
+    registry = ApplicationRegistry(engine=engine)
+    job = registry.create_job("fenced-write")
+    stale_fenced = False
+
+    def reclaim_then_write(_payload, progress):
+        nonlocal stale_fenced
+        with registry.sessions.begin() as session:
+            row = session.get(JobRecord, job.id)
+            assert row is not None
+            row.claim_generation += 1
+            row.lease_owner = "replacement"
+        with registry.sessions.begin() as session:
+            try:
+                progress.fence(session)
+            except LostJobLeaseError:
+                stale_fenced = True
+
+    DurableJobWorker(registry, {"fenced-write": reclaim_then_write}, worker_id="original").run_once(
+        now=datetime.now(UTC)
+    )
+
+    assert stale_fenced is True
 
 
 def test_placeholder_paper_session_is_initialized_without_losing_request() -> None:

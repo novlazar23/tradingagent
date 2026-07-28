@@ -79,9 +79,13 @@ def _print(value: Any) -> None:
     print(json.dumps(value, sort_keys=True, default=str))
 
 
-def _runtime_handlers() -> dict[str, Any]:
+def _runtime_config() -> AppConfig:
     path = Path(__import__("os").environ.get("TRADINGAGENT_CONFIG", "/app/config/config.yaml"))
-    config = AppConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+    return AppConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+
+
+def _runtime_handlers(config: AppConfig | None = None) -> dict[str, Any]:
+    config = config or _runtime_config()
     history = OctoBotHistoryClient(
         str(config.deployment.history_base_url),
         config.deployment.history_api_key_file,
@@ -107,11 +111,12 @@ def main(argv: list[str] | None = None) -> int:
             if not worker.run_once():
                 time.sleep(1)
     if args.command == "run-scheduler":
+        config = _runtime_config()
         scheduler = JobScheduler(REGISTRY, interval=timedelta(minutes=15))
         while True:
             scheduler.enqueue_due()
             scheduler.enqueue_data_syncs()
-            time.sleep(30)
+            time.sleep(config.deployment.paper_poll_seconds)
     if args.command == "config":
         payload = yaml.safe_load(args.path.read_text())
         AppConfig.model_validate(payload)
@@ -121,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "datasets":
             _print({"datasets": REGISTRY.datasets})
         elif args.action == "sync":
-            _print(REGISTRY.create_job("data_sync"))
+            _print(REGISTRY.create_job("data_sync", {"dataset_id": args.dataset_id}))
         else:
             _print({"dataset_id": args.dataset_id, "gaps": REGISTRY.gaps(args.dataset_id)})
         return 0

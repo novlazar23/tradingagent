@@ -72,6 +72,27 @@ def test_registry_resources_and_idempotency_survive_process_restart() -> None:
     assert restarted.job(operation.job_id).status == "queued"
 
 
+def test_idempotency_failure_rolls_back_resource_and_job_atomically() -> None:
+    database = engine()
+    registry = ApplicationRegistry(engine=database)
+
+    def create_then_crash():
+        registry.create("backtest", {"dataset_id": "btc"})
+        raise RuntimeError("crash before idempotency commit")
+
+    try:
+        registry.idempotent("crash", "backtest_create", {"dataset_id": "btc"}, create_then_crash)
+    except RuntimeError:
+        pass
+
+    with registry.sessions() as session:
+        from tradingagent.persistence.models import BacktestRun, IdempotencyRecord, JobRecord
+
+        assert session.query(BacktestRun).count() == 0
+        assert session.query(JobRecord).count() == 0
+        assert session.query(IdempotencyRecord).count() == 0
+
+
 def test_resource_transition_and_idempotency_are_one_transaction() -> None:
     database = engine()
     registry = ApplicationRegistry(engine=database)

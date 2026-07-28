@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 
+import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
@@ -10,9 +11,11 @@ from tradingagent.backtest import BacktestConfig, BacktestEngine
 from tradingagent.config import CostConfig, RiskConfig, StrategyConfig
 from tradingagent.domain import Candle
 from tradingagent.persistence.handlers import (
+    _bounded_catch_up,
     _paper_execution_rows,
     _persist_candle_batch,
     _strategy_request,
+    _visible_candles,
 )
 from tradingagent.persistence.models import Base, CandleRecord, CandleRevision, DataGap
 from tradingagent.trading import ExecutionModel, RiskEngine, StrategyEngine, TradingPipeline
@@ -228,3 +231,22 @@ def test_candle_batch_insert_and_revision_are_bounded_and_idempotent() -> None:
         db.commit()
         assert db.scalar(select(CandleRecord.close)) == Decimal("101.5")
         assert db.scalar(select(CandleRevision.id)) is not None
+
+
+def test_visible_candles_exclude_future_data_from_catch_up_indicators() -> None:
+    history = candles("15m", 5)
+
+    visible = _visible_candles(history, history[2].close_time)
+
+    assert [candle.source_fingerprint for candle in visible] == [
+        "15m-0",
+        "15m-1",
+        "15m-2",
+    ]
+
+
+def test_paper_catch_up_fails_closed_instead_of_skipping_old_successors() -> None:
+    rows = records({"15m": candles("15m", 3)})
+
+    with pytest.raises(ValueError, match="paper catch-up exceeds"):
+        _bounded_catch_up(rows, maximum=2)

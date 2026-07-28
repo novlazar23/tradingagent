@@ -317,6 +317,7 @@ class RuntimeHandlerFactory:
         )
         state = repository.get(session_id)
         snapshot_id = state.configuration_versions[1]
+        checkpoint_time = state.checkpoint.candle_close_time if state.checkpoint else None
         with self.registry.sessions() as db:
             snapshot = db.get(
                 __import__(
@@ -333,30 +334,46 @@ class RuntimeHandlerFactory:
             if snapshot is None or paper is None:
                 raise ValueError("paper lineage is incomplete")
             dataset_id = str(paper.request.get("dataset_id", payload.get("dataset_id", "")))
+            successor_query = select(CandleRecord).where(
+                CandleRecord.dataset_id == dataset_id,
+                CandleRecord.timeframe == "15m",
+                CandleRecord.is_closed.is_(True),
+            )
+            if checkpoint_time is not None:
+                successor_query = successor_query.where(CandleRecord.close_time > checkpoint_time)
+            execution_rows = _bounded_catch_up(
+                db.scalars(
+                    successor_query.order_by(CandleRecord.close_time, CandleRecord.id).limit(
+                        self.config.deployment.backtest_max_candles + 1
+                    )
+                ).all(),
+                self.config.deployment.backtest_max_candles,
+            )
             rows: list[CandleRecord] = []
-            for timeframe in ("15m", "1h", "4h", "1d"):
-                maximum = (
-                    self.config.deployment.backtest_max_candles
-                    * 15
-                    // _TIMEFRAME_MINUTES[timeframe]
-                )
-                rows.extend(
-                    db.scalars(
-                        select(CandleRecord)
-                        .where(
-                            CandleRecord.dataset_id == dataset_id,
-                            CandleRecord.timeframe == timeframe,
-                            CandleRecord.is_closed.is_(True),
-                        )
-                        .order_by(CandleRecord.close_time.desc())
-                        .limit(maximum)
-                    ).all()
-                )
+            if execution_rows:
+                last_decision = execution_rows[-1].close_time
+                for timeframe in ("15m", "1h", "4h", "1d"):
+                    maximum = (
+                        self.config.deployment.backtest_max_candles
+                        * 15
+                        // _TIMEFRAME_MINUTES[timeframe]
+                    )
+                    rows.extend(
+                        db.scalars(
+                            select(CandleRecord)
+                            .where(
+                                CandleRecord.dataset_id == dataset_id,
+                                CandleRecord.timeframe == timeframe,
+                                CandleRecord.is_closed.is_(True),
+                                CandleRecord.close_time <= last_decision,
+                            )
+                            .order_by(CandleRecord.close_time.desc())
+                            .limit(maximum + _FEATURE_LOOKBACK_CANDLES)
+                        ).all()
+                    )
             gaps = db.scalars(select(DataGap).where(DataGap.dataset_id == dataset_id)).all()
         resolved = self.snapshots.resolve(snapshot.payload, code_version=self.code_version)
         engine = self._paper_engine(resolved, repository=repository)
-        checkpoint_time = state.checkpoint.candle_close_time if state.checkpoint else None
-        execution_rows = _paper_execution_rows(rows, checkpoint_time)
         if not execution_rows:
             progress(100)
             return {
@@ -400,7 +417,7 @@ class RuntimeHandlerFactory:
                     candle_low=candle.low,
                     candle_high=candle.high,
                     atr=_latest_atr(
-                        candles_by_timeframe["15m"],
+                        _visible_candles(candles_by_timeframe["15m"], decision_time),
                         resolved.configuration.strategy.indicator_parameters,
                     ),
                     strategy_request=request,
@@ -529,6 +546,16 @@ def _paper_execution_rows(
     )
 
 
+def _bounded_catch_up(
+    rows: Sequence[CandleRecord],
+    maximum: int,
+) -> list[CandleRecord]:
+    """Fail closed rather than silently skipping an oversized successor range."""
+    if len(rows) > maximum:
+        raise ValueError(f"paper catch-up exceeds configured backtest_max_candles={maximum}")
+    return list(rows)
+
+
 def _strategy_request(
     *,
     strategy: StrategyConfig,
@@ -558,10 +585,7 @@ def _strategy_request(
     }
     for timeframe in ("15m", "1h", "4h", "1d"):
         timeframe_candles = candles_by_timeframe[timeframe]
-        visible_end = bisect_right(
-            timeframe_candles, decision_time, key=lambda candle: candle.close_time
-        )
-        visible = timeframe_candles[max(0, visible_end - _FEATURE_LOOKBACK_CANDLES) : visible_end]
+        visible = _visible_candles(timeframe_candles, decision_time)
         if not visible:
             blockers.append(f"missing closed {timeframe} candle")
             continue
@@ -635,6 +659,15 @@ def _latest_atr(candles: tuple[Candle, ...], parameters: Mapping[str, Decimal]) 
     if not candles:
         return None
     return calculate_indicators(candles, _indicator_config(parameters)).atr
+
+
+def _visible_candles(
+    candles: tuple[Candle, ...],
+    decision_time: datetime,
+) -> tuple[Candle, ...]:
+    """Return only the bounded history observable at a decision."""
+    visible_end = bisect_right(candles, decision_time, key=lambda candle: candle.close_time)
+    return candles[max(0, visible_end - _FEATURE_LOOKBACK_CANDLES) : visible_end]
 
 
 def _candle_ids(rows: Sequence[CandleRecord]) -> dict[tuple[str, datetime], str]:

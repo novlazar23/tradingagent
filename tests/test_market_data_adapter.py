@@ -151,3 +151,27 @@ def test_default_transport_disables_redirects_and_bounds_reads() -> None:
 
     assert transport.max_response_bytes == 123
     assert transport.redirects_allowed is False
+
+
+def test_adapter_never_exposes_secret_in_transport_errors_or_logs(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    secret_value = "acceptance-secret-must-not-leak"
+    secret = tmp_path / "key"
+    secret.write_text(secret_value)
+    transport = ScriptedTransport(
+        [HTTPError(f"http://history:5002/{secret_value}", 401, secret_value, {}, None)]
+    )
+    client = OctoBotHistoryClient(
+        "http://history:5002",
+        secret,
+        transport=transport,
+        max_retries=0,
+    )
+
+    with pytest.raises(RuntimeError, match="history request failed") as captured:
+        client.list_datasets()
+
+    assert secret_value not in str(captured.value)
+    assert secret_value not in caplog.text
+    assert transport.calls[0][2] == {"X-API-Key": secret_value}

@@ -24,6 +24,8 @@ def test_compose_keeps_database_private_and_containers_hardened() -> None:
     assert "cap_drop:" in compose
     assert "internal: true" in compose
     assert "OCTOBOT_HISTORY_API_KEY:" not in compose
+    assert 'user: "70:70"' in postgres
+    assert "cap_add:" not in postgres
 
 
 def test_image_contains_no_history_secret() -> None:

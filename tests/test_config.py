@@ -56,6 +56,14 @@ def valid_config() -> dict[str, object]:
     }
 
 
+def test_history_page_limit_is_capped_at_upstream_contract() -> None:
+    payload = valid_config()
+    payload["deployment"]["history_page_limit"] = 501  # type: ignore[index]
+
+    with pytest.raises(ValidationError):
+        AppConfig.model_validate(payload)
+
+
 def test_configuration_requires_complete_explicit_values() -> None:
     payload = valid_config()
     del payload["risk"]

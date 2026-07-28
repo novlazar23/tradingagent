@@ -1,6 +1,14 @@
+import json
+import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+from tradingagent.api.app import create_app
+from tradingagent.logging import configure_logging
 
 ROOT = Path(__file__).parents[1]
 
@@ -12,6 +20,24 @@ def test_compose_declares_separate_mandatory_services_and_secret() -> None:
         assert service in compose
     assert "octobot_history_api_key" in compose
     assert "read_only: true" in compose
+
+
+def test_compose_uses_secret_only_database_password_and_migration_gate() -> None:
+    compose = (ROOT / "compose.yaml").read_text()
+    assert "POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password" in compose
+    assert "DATABASE_PASSWORD_FILE: /run/secrets/postgres_password" in compose
+    assert "POSTGRES_PASSWORD:" not in compose
+    assert "DATABASE_URL:" not in compose
+    assert "migrate:" in compose
+    assert "condition: service_completed_successfully" in compose
+
+
+def test_history_proxy_runs_unprivileged_without_capabilities() -> None:
+    compose = (ROOT / "compose.yaml").read_text()
+    proxy = compose.split("\n  history-proxy:\n", 1)[1].split("\n  postgres:\n", 1)[0]
+    assert 'user: "101:101"' in proxy
+    assert "cap_drop:\n      - ALL" in proxy
+    assert "cap_add:" not in proxy
 
 
 def test_compose_isolates_apps_behind_fixed_history_proxy() -> None:
@@ -44,6 +70,36 @@ def test_initial_migration_is_present() -> None:
     assert "Base.metadata.create_all" in migrations[0].read_text()
 
 
+def test_compose_renders_as_a_static_deployment_contract(tmp_path: Path) -> None:
+    history_secret = tmp_path / "history_api_key"
+    history_secret.write_text("compose-validation-only")
+    postgres_secret = tmp_path / "postgres_password"
+    postgres_secret.write_text("compose-validation-only")
+    environment = {
+        **os.environ,
+        "POSTGRES_PASSWORD": "compose-validation-only",
+        "OCTOBOT_HISTORY_API_KEY_FILE": str(history_secret),
+        "POSTGRES_PASSWORD_FILE": str(postgres_secret),
+    }
+    result = subprocess.run(
+        ["docker", "compose", "-f", str(ROOT / "compose.yaml"), "config", "--quiet"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_generated_openapi_is_deterministic_and_valid_json() -> None:
+    api = TestClient(create_app())
+    first = api.get("/openapi.json")
+    second = api.get("/openapi.json")
+
+    assert first.status_code == second.status_code == 200
+    assert json.loads(first.text) == json.loads(second.text)
+
+
 def test_container_entrypoint_exposes_service_roles() -> None:
     result = subprocess.run(
         [
@@ -59,3 +115,29 @@ def test_container_entrypoint_exposes_service_roles() -> None:
 
     for role in ("serve-api", "run-worker", "run-scheduler"):
         assert role in result.stdout
+
+
+def test_logging_bootstrap_emits_structured_json(capsys: object) -> None:
+    configure_logging()
+    logging.getLogger("tradingagent.test").info(
+        "safe_event", extra={"event": "safe_event", "job_id": "job-1"}
+    )
+    payload = json.loads(capsys.readouterr().err)  # type: ignore[attr-defined]
+    assert payload["level"] == "INFO"
+    assert payload["event"] == "safe_event"
+    assert payload["job_id"] == "job-1"
+
+
+def test_ci_gates_quality_contract_integration_security_and_sbom() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    for gate in (
+        "ruff format --check",
+        "ruff check",
+        "mypy",
+        "pytest",
+        "docker compose config",
+        "pip-audit",
+        "trivy",
+        "syft",
+    ):
+        assert gate in workflow

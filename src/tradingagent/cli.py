@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import time
@@ -14,13 +13,15 @@ import uvicorn
 import yaml
 
 from tradingagent.api.services import ApplicationRegistry
-from tradingagent.config import AppConfig
+from tradingagent.config import AppConfig, database_url_from_environment
+from tradingagent.logging import configure_logging
+from tradingagent.market_data.adapter import OctoBotHistoryClient
+from tradingagent.persistence.handlers import RuntimeHandlerFactory
 from tradingagent.persistence.runtime import DurableJobWorker, JobScheduler
 
+_DATABASE_URL = database_url_from_environment()
 REGISTRY = (
-    ApplicationRegistry.from_database_url(os.environ["DATABASE_URL"])
-    if "DATABASE_URL" in os.environ
-    else ApplicationRegistry()
+    ApplicationRegistry.from_database_url(_DATABASE_URL) if _DATABASE_URL else ApplicationRegistry()
 )
 
 
@@ -78,14 +79,30 @@ def _print(value: Any) -> None:
     print(json.dumps(value, sort_keys=True, default=str))
 
 
+def _runtime_handlers() -> dict[str, Any]:
+    path = Path(__import__("os").environ.get("TRADINGAGENT_CONFIG", "/app/config/config.yaml"))
+    config = AppConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+    history = OctoBotHistoryClient(
+        str(config.deployment.history_base_url),
+        config.deployment.history_api_key_file,
+    )
+    return RuntimeHandlerFactory(
+        REGISTRY,
+        config=config,
+        history=history,
+        code_version=__import__("os").environ.get("TRADINGAGENT_CODE_VERSION", "development"),
+    ).handlers()
+
+
 def main(argv: list[str] | None = None) -> int:
     """Dispatch a command and return a process exit code."""
+    configure_logging()
     args = build_parser().parse_args(argv)
     if args.command == "serve-api":
         uvicorn.run("tradingagent.api.app:app", host="0.0.0.0", port=8000)
         return 0
     if args.command == "run-worker":
-        worker = DurableJobWorker(REGISTRY, {})
+        worker = DurableJobWorker(REGISTRY, _runtime_handlers())
         while True:
             if not worker.run_once():
                 time.sleep(1)

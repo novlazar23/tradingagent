@@ -1,19 +1,19 @@
 """FastAPI composition root with safe observability and versioned routes."""
 
 import logging
-import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from fastapi import FastAPI, Header, Request
+from fastapi import FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     CollectorRegistry,
     Counter,
+    Gauge,
     Histogram,
     generate_latest,
 )
@@ -30,7 +30,8 @@ from tradingagent.api.models import (
     StrategyValidationRequest,
 )
 from tradingagent.api.services import ApplicationError, ApplicationRegistry
-from tradingagent.config import AppConfig
+from tradingagent.config import StrategyValidationConfig, database_url_from_environment
+from tradingagent.logging import configure_logging
 
 LOGGER = logging.getLogger("tradingagent.api")
 ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
@@ -74,12 +75,70 @@ def create_app(registry: ApplicationRegistry | None = None) -> FastAPI:
         ("kind",),
         registry=metrics_registry,
     )
+    job_duration = Histogram(
+        "tradingagent_job_duration_seconds",
+        "Background job duration by kind",
+        ("kind",),
+        registry=metrics_registry,
+    )
+    job_failures = Counter(
+        "tradingagent_job_failures_total",
+        "Terminal background job failures",
+        ("kind", "error_class"),
+        registry=metrics_registry,
+    )
+    job_retries = Counter(
+        "tradingagent_job_retries_total",
+        "Background job retry attempts",
+        ("kind",),
+        registry=metrics_registry,
+    )
+    candles_processed = Counter(
+        "tradingagent_candles_processed_total",
+        "Closed candles processed",
+        ("timeframe",),
+        registry=metrics_registry,
+    )
+    signal_decisions = Counter(
+        "tradingagent_signal_decisions_total",
+        "Strategy decisions",
+        ("action",),
+        registry=metrics_registry,
+    )
+    risk_rejections = Counter(
+        "tradingagent_risk_rejections_total",
+        "Risk-engine rejections",
+        ("reason",),
+        registry=metrics_registry,
+    )
+    portfolio_equity = Gauge(
+        "tradingagent_portfolio_equity",
+        "Current paper portfolio equity",
+        ("session_id",),
+        registry=metrics_registry,
+    )
+    data_freshness = Gauge(
+        "tradingagent_market_data_freshness_seconds",
+        "Age of latest closed candle",
+        ("timeframe",),
+        registry=metrics_registry,
+    )
     app = FastAPI(
         title="tradingagent internal API",
         version="1.0.0",
         description="Internal-only backtest and paper-trading control plane. No live orders.",
     )
     app.state.registry = services
+    app.state.metrics = {
+        "job_duration": job_duration,
+        "job_failures": job_failures,
+        "job_retries": job_retries,
+        "candles_processed": candles_processed,
+        "signal_decisions": signal_decisions,
+        "risk_rejections": risk_rejections,
+        "portfolio_equity": portfolio_equity,
+        "data_freshness": data_freshness,
+    }
 
     @app.middleware("http")
     async def request_context(
@@ -165,8 +224,11 @@ def create_app(registry: ApplicationRegistry | None = None) -> FastAPI:
         )
 
     @app.get("/api/v1/datasets", response_model=DatasetList)
-    def datasets() -> DatasetList:
-        return DatasetList(datasets=services.datasets)
+    def datasets(
+        cursor: str | None = None, limit: int = Query(default=100, ge=1, le=500)
+    ) -> DatasetList:
+        items, next_cursor = services.dataset_page(cursor=cursor, limit=limit)
+        return DatasetList(datasets=items, next_cursor=next_cursor)
 
     @app.post(
         "/api/v1/data/sync", response_model=JobView, status_code=202, responses=ERROR_RESPONSES
@@ -186,8 +248,13 @@ def create_app(registry: ApplicationRegistry | None = None) -> FastAPI:
         return result
 
     @app.get("/api/v1/data/gaps")
-    def gaps(dataset_id: str) -> dict[str, object]:
-        return {"dataset_id": dataset_id, "gaps": services.gaps(dataset_id)}
+    def gaps(
+        dataset_id: str,
+        cursor: str | None = None,
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, object]:
+        items, next_cursor = services.gap_page(dataset_id, cursor=cursor, limit=limit)
+        return {"dataset_id": dataset_id, "gaps": items, "next_cursor": next_cursor}
 
     @app.post("/api/v1/strategies/validate", responses=ERROR_RESPONSES)
     def validate_strategy(
@@ -198,14 +265,13 @@ def create_app(registry: ApplicationRegistry | None = None) -> FastAPI:
 
         def validate() -> dict[str, object]:
             try:
-                configuration = AppConfig.model_validate(payload.configuration)
+                StrategyValidationConfig.model_validate(payload.configuration)
             except ValueError as exc:
                 raise ApplicationError(
                     "invalid_configuration", "Strategy configuration is invalid", 422
                 ) from exc
             return {
                 "valid": True,
-                "configuration": configuration.model_dump(mode="json"),
             }
 
         return services.idempotent(
@@ -296,12 +362,22 @@ def create_app(registry: ApplicationRegistry | None = None) -> FastAPI:
         return services.resource(resource_id, "paper_session")
 
     @app.get("/api/v1/paper-sessions/{resource_id}/decisions", responses=ERROR_RESPONSES)
-    def decisions(resource_id: str) -> dict[str, object]:
-        return {"session_id": resource_id, "decisions": services.decisions(resource_id)}
+    def decisions(
+        resource_id: str,
+        cursor: str | None = None,
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, object]:
+        items, next_cursor = services.decision_page(resource_id, cursor=cursor, limit=limit)
+        return {"session_id": resource_id, "decisions": items, "next_cursor": next_cursor}
 
     @app.get("/api/v1/paper-sessions/{resource_id}/ledger", responses=ERROR_RESPONSES)
-    def ledger(resource_id: str) -> dict[str, object]:
-        return {"session_id": resource_id, "entries": services.ledger(resource_id)}
+    def ledger(
+        resource_id: str,
+        cursor: str | None = None,
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, object]:
+        items, next_cursor = services.ledger_page(resource_id, cursor=cursor, limit=limit)
+        return {"session_id": resource_id, "entries": items, "next_cursor": next_cursor}
 
     @app.get("/api/v1/jobs/{resource_id}", response_model=JobView, responses=ERROR_RESPONSES)
     def job(resource_id: str) -> JobView:
@@ -311,7 +387,7 @@ def create_app(registry: ApplicationRegistry | None = None) -> FastAPI:
 
 
 def _runtime_registry() -> ApplicationRegistry:
-    database_url = os.getenv("DATABASE_URL")
+    database_url = database_url_from_environment()
     return (
         ApplicationRegistry.from_database_url(database_url)
         if database_url
@@ -319,4 +395,5 @@ def _runtime_registry() -> ApplicationRegistry:
     )
 
 
+configure_logging()
 app = create_app(_runtime_registry())

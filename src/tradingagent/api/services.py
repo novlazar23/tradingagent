@@ -4,8 +4,10 @@ import hashlib
 import json
 import threading
 import uuid
+from base64 import urlsafe_b64decode, urlsafe_b64encode
+from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, Protocol
 
 from sqlalchemy import Engine, create_engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -13,6 +15,8 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from tradingagent.api.models import AcceptedOperation, JobView, ResourceView
+from tradingagent.paper.models import SessionAuditEvent, SessionStatus
+from tradingagent.paper.repository import SQLAlchemyPaperRepository
 from tradingagent.persistence.models import (
     BacktestMetric,
     BacktestRun,
@@ -25,6 +29,7 @@ from tradingagent.persistence.models import (
     PaperSession,
     SignalDecisionRecord,
 )
+from tradingagent.trading.risk import RiskAuditEvent
 
 
 class ApplicationError(Exception):
@@ -39,6 +44,30 @@ class ApplicationError(Exception):
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _encode_cursor(identifier: str) -> str:
+    return urlsafe_b64encode(identifier.encode()).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str | None) -> str | None:
+    if cursor is None:
+        return None
+    try:
+        return urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode()
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ApplicationError("invalid_cursor", "Cursor is invalid", 422) from exc
+
+
+class _HasId(Protocol):
+    id: str
+
+
+def _page_result[T: _HasId](rows: list[T], limit: int) -> tuple[list[T], str | None]:
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    cursor = _encode_cursor(page[-1].id) if has_more and page else None
+    return page, cursor
 
 
 class ApplicationRegistry:
@@ -85,11 +114,20 @@ class ApplicationRegistry:
 
     @property
     def datasets(self) -> list[dict[str, object]]:
+        return self.dataset_page(cursor=None, limit=500)[0]
+
+    def dataset_page(
+        self, *, cursor: str | None, limit: int
+    ) -> tuple[list[dict[str, object]], str | None]:
+        after = _decode_cursor(cursor)
         with self.sessions() as session:
-            records = session.scalars(
-                select(MarketDataset).order_by(MarketDataset.external_id)
-            ).all()
-            return [
+            statement = select(MarketDataset).order_by(MarketDataset.id)
+            if after is not None:
+                statement = statement.where(MarketDataset.id > after)
+            records, next_cursor = _page_result(
+                list(session.scalars(statement.limit(limit + 1)).all()), limit
+            )
+            items: list[dict[str, object]] = [
                 {
                     "id": record.id,
                     "source": record.source,
@@ -100,6 +138,7 @@ class ApplicationRegistry:
                 }
                 for record in records
             ]
+            return items, next_cursor
 
     def readiness(
         self,
@@ -283,14 +322,18 @@ class ApplicationRegistry:
 
     @staticmethod
     def _job_view(record: JobRecord) -> JobView:
+        public_error_classes = {"data_error", "configuration_error", "dependency_error"}
+        error_class = (
+            record.error_class if record.error_class in public_error_classes else "internal_error"
+        )
         return JobView(
             id=record.id,
             kind=record.kind,
             status=record.status,  # type: ignore[arg-type]
             progress=record.progress,
             retry_count=record.retry_count,
-            error_class=record.error_class,
-            error_message=record.error_message,
+            error_class=error_class if record.error_class else None,
+            error_message="Job failed" if record.error_message else None,
         )
 
     def resource(self, resource_id: str, expected_kind: str) -> ResourceView:
@@ -331,6 +374,47 @@ class ApplicationRegistry:
             ("running", "stop"): "stopped",
             ("paused", "stop"): "stopped",
         }
+        with self.sessions() as session:
+            persisted = session.get(PaperSession, resource_id)
+            has_runtime_state = persisted is not None and "_state" in persisted.request
+        if has_runtime_state:
+            repository = SQLAlchemyPaperRepository(self.engine)
+            state = repository.get(resource_id)
+            target = transitions.get((state.status.value.lower(), action))
+            if target is None:
+                raise ApplicationError(
+                    "invalid_state_transition",
+                    f"Cannot {action} a session in state {state.status.value.lower()}",
+                    409,
+                )
+            now = _utcnow()
+            risk_state = state.risk_state
+            if action == "resume" and risk_state.paused:
+                risk_state = replace(
+                    risk_state,
+                    paused=False,
+                    pause_reason=None,
+                    audit_events=(
+                        *risk_state.audit_events,
+                        RiskAuditEvent("risk_resume", now, "api-admin"),
+                    ),
+                )
+            updated = replace(
+                state,
+                status=SessionStatus(target.upper()),
+                risk_state=risk_state,
+                audit_events=(
+                    *state.audit_events,
+                    SessionAuditEvent(action, now, "api-admin", ""),
+                ),
+            )
+            repository.save(updated)
+            return ResourceView(
+                id=resource_id,
+                kind="paper_session",
+                state=target,
+                request=self.resource(resource_id, "paper_session").request,
+            )
         with self.sessions.begin() as session:
             resource = session.get(PaperSession, resource_id)
             if resource is None:
@@ -352,11 +436,20 @@ class ApplicationRegistry:
             )
 
     def gaps(self, dataset_id: str) -> list[dict[str, object]]:
+        return self.gap_page(dataset_id, cursor=None, limit=500)[0]
+
+    def gap_page(
+        self, dataset_id: str, *, cursor: str | None, limit: int
+    ) -> tuple[list[dict[str, object]], str | None]:
+        after = _decode_cursor(cursor)
         with self.sessions() as session:
-            rows = session.scalars(
-                select(DataGap).where(DataGap.dataset_id == dataset_id).order_by(DataGap.start_time)
-            ).all()
-            return [
+            statement = select(DataGap).where(DataGap.dataset_id == dataset_id).order_by(DataGap.id)
+            if after is not None:
+                statement = statement.where(DataGap.id > after)
+            rows, next_cursor = _page_result(
+                list(session.scalars(statement.limit(limit + 1)).all()), limit
+            )
+            items: list[dict[str, object]] = [
                 {
                     "id": row.id,
                     "timeframe": row.timeframe,
@@ -367,6 +460,7 @@ class ApplicationRegistry:
                 }
                 for row in rows
             ]
+            return items, next_cursor
 
     def backtest_report(self, resource_id: str) -> dict[str, object]:
         with self.sessions() as session:
@@ -387,14 +481,25 @@ class ApplicationRegistry:
             }
 
     def decisions(self, session_id: str) -> list[dict[str, object]]:
+        return self.decision_page(session_id, cursor=None, limit=500)[0]
+
+    def decision_page(
+        self, session_id: str, *, cursor: str | None, limit: int
+    ) -> tuple[list[dict[str, object]], str | None]:
         self.resource(session_id, "paper_session")
+        after = _decode_cursor(cursor)
         with self.sessions() as session:
-            rows = session.scalars(
+            statement = (
                 select(SignalDecisionRecord)
                 .where(SignalDecisionRecord.paper_session_id == session_id)
-                .order_by(SignalDecisionRecord.decided_at)
-            ).all()
-            return [
+                .order_by(SignalDecisionRecord.id)
+            )
+            if after is not None:
+                statement = statement.where(SignalDecisionRecord.id > after)
+            rows, next_cursor = _page_result(
+                list(session.scalars(statement.limit(limit + 1)).all()), limit
+            )
+            items: list[dict[str, object]] = [
                 {
                     "id": row.id,
                     "action": row.action,
@@ -404,16 +509,28 @@ class ApplicationRegistry:
                 }
                 for row in rows
             ]
+            return items, next_cursor
 
     def ledger(self, session_id: str) -> list[dict[str, object]]:
+        return self.ledger_page(session_id, cursor=None, limit=500)[0]
+
+    def ledger_page(
+        self, session_id: str, *, cursor: str | None, limit: int
+    ) -> tuple[list[dict[str, object]], str | None]:
         self.resource(session_id, "paper_session")
+        after = _decode_cursor(cursor)
         with self.sessions() as session:
-            rows = session.scalars(
+            statement = (
                 select(CashLedgerRecord)
                 .where(CashLedgerRecord.session_id == session_id)
-                .order_by(CashLedgerRecord.occurred_at)
-            ).all()
-            return [
+                .order_by(CashLedgerRecord.id)
+            )
+            if after is not None:
+                statement = statement.where(CashLedgerRecord.id > after)
+            rows, next_cursor = _page_result(
+                list(session.scalars(statement.limit(limit + 1)).all()), limit
+            )
+            items: list[dict[str, object]] = [
                 {
                     "id": row.id,
                     "entry_type": row.entry_type,
@@ -424,3 +541,4 @@ class ApplicationRegistry:
                 }
                 for row in rows
             ]
+            return items, next_cursor

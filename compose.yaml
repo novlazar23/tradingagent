@@ -8,11 +8,16 @@ x-app: &app
   cap_drop:
     - ALL
   environment:
-    DATABASE_URL: postgresql+psycopg://tradingagent:${POSTGRES_PASSWORD:?required}@postgres/tradingagent
+    DATABASE_HOST: postgres
+    DATABASE_PORT: "5432"
+    DATABASE_NAME: tradingagent
+    DATABASE_USER: tradingagent
+    DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
     OCTOBOT_HISTORY_BASE_URL: http://history-proxy:8080
     OCTOBOT_HISTORY_API_KEY_FILE: /run/secrets/octobot_history_api_key
   secrets:
     - octobot_history_api_key
+    - postgres_password
   depends_on:
     postgres:
       condition: service_healthy
@@ -35,7 +40,10 @@ x-app: &app
 services:
   api:
     <<: *app
-    command: ["tradingagent", "serve-api"]
+    command: ["serve-api"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
     healthcheck:
@@ -51,30 +59,36 @@ services:
 
   worker:
     <<: *app
-    command: ["tradingagent", "run-worker"]
+    command: ["run-worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
   scheduler:
     <<: *app
-    command: ["tradingagent", "run-scheduler"]
+    command: ["run-scheduler"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["db", "migrate"]
 
   history-proxy:
     image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
     restart: unless-stopped
+    user: "101:101"
     read_only: true
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    cap_add:
-      - CHOWN
-      - NET_BIND_SERVICE
-      - SETGID
-      - SETUID
     volumes:
       - ./infra/history-proxy.conf:/etc/nginx/nginx.conf:ro
     tmpfs:
-      - /var/cache/nginx:size=16m
-      - /var/run:size=1m
+      - /tmp:size=16m,mode=1777
     networks:
       - history-client
       - history-egress
@@ -82,10 +96,13 @@ services:
   postgres:
     image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     restart: unless-stopped
+    user: "70:70"
     environment:
       POSTGRES_DB: tradingagent
       POSTGRES_USER: tradingagent
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U tradingagent -d tradingagent"]
       interval: 5s
@@ -93,22 +110,22 @@ services:
       retries: 10
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    tmpfs:
+      - /run/postgresql:size=8m,uid=70,gid=70,mode=0770
+      - /tmp:size=16m,mode=1777
     networks:
       - backend
     security_opt:
       - no-new-privileges:true
+    read_only: true
     cap_drop:
       - ALL
-    cap_add:
-      - CHOWN
-      - DAC_OVERRIDE
-      - FOWNER
-      - SETGID
-      - SETUID
 
 secrets:
   octobot_history_api_key:
     file: ${OCTOBOT_HISTORY_API_KEY_FILE:?required}
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_FILE:?required}
 
 volumes:
   postgres-data:

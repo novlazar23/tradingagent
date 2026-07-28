@@ -41,7 +41,10 @@ class ConfigurationSnapshot(Base):
 
 class MarketDataset(Base):
     __tablename__ = "market_datasets"
-    __table_args__ = (UniqueConstraint("source", "external_id", name="uq_dataset_source_id"),)
+    __table_args__ = (
+        UniqueConstraint("source", "external_id", name="uq_dataset_source_id"),
+        Index("ix_market_datasets_page", "id"),
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     external_id: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -96,6 +99,7 @@ class DataGap(Base):
     __table_args__ = (
         UniqueConstraint("dataset_id", "timeframe", "start_time", name="uq_data_gap"),
         Index("ix_data_gaps_open", "dataset_id", "resolved_at"),
+        Index("ix_data_gaps_page", "dataset_id", "id"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     dataset_id: Mapped[str] = mapped_column(ForeignKey("market_datasets.id"), nullable=False)
@@ -155,6 +159,7 @@ class SignalDecisionRecord(Base):
     __table_args__ = (
         UniqueConstraint("paper_session_id", "candle_id", name="uq_paper_candle_decision"),
         Index("ix_signal_decisions_session_time", "paper_session_id", "decided_at"),
+        Index("ix_signal_decisions_page", "paper_session_id", "id"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     paper_session_id: Mapped[str | None] = mapped_column(ForeignKey("paper_sessions.id"))
@@ -209,6 +214,7 @@ class FillRecord(Base):
     price: Mapped[Decimal] = mapped_column(DECIMAL, nullable=False)
     quantity: Mapped[Decimal] = mapped_column(DECIMAL, nullable=False)
     fee: Mapped[Decimal] = mapped_column(DECIMAL, nullable=False)
+    details: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
@@ -225,6 +231,7 @@ class CashLedgerRecord(Base):
     __table_args__ = (
         UniqueConstraint("session_id", "reference_id", "entry_type", name="uq_ledger_ref_type"),
         Index("ix_cash_ledger_session_time", "session_id", "occurred_at"),
+        Index("ix_cash_ledger_page", "session_id", "id"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     session_id: Mapped[str] = mapped_column(ForeignKey("paper_sessions.id"), nullable=False)
@@ -265,6 +272,8 @@ class JobRecord(Base):
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

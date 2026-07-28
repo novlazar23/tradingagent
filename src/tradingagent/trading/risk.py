@@ -108,6 +108,18 @@ class RiskEngine:
             quantity = execution_model.round_quantity(quantity)
         if quantity <= 0:
             return self._approval(False, Decimal(0), None, None, ["insufficient cash"])
+        if (
+            execution_model is not None
+            and quantity * (unit_cash_cost / (Decimal(1) + execution_model.config.taker_fee_rate))
+            < execution_model.config.minimum_order_value
+        ):
+            return self._approval(
+                False,
+                Decimal(0),
+                None,
+                None,
+                ["order value is below configured minimum"],
+            )
         stop = entry_price - stop_distance
         take_profit = (
             entry_price

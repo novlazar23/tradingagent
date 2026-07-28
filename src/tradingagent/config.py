@@ -1,7 +1,10 @@
 """Strict, immutable configuration contracts for reproducible trading runs."""
 
+import os
 from decimal import Decimal
+from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, model_validator
 
@@ -18,7 +21,7 @@ class DeploymentConfig(StrictConfigModel):
     database_url: str = Field(min_length=1)
     history_base_url: AnyHttpUrl
     history_api_key_file: str = Field(min_length=1)
-    history_page_limit: int = Field(gt=0, le=10_000)
+    history_page_limit: int = Field(gt=0, le=500)
     paper_poll_seconds: int = Field(gt=0)
     paper_max_candle_age_seconds: int = Field(gt=0)
 
@@ -98,3 +101,27 @@ class AppConfig(StrictConfigModel):
     costs: CostConfig
     risk: RiskConfig
     strategy: StrategyConfig
+
+
+class StrategyValidationConfig(StrictConfigModel):
+    """Safe, deployment-secret-free strategy validation envelope."""
+
+    strategy: StrategyConfig
+    risk: RiskConfig
+    costs: CostConfig
+
+
+def database_url_from_environment() -> str | None:
+    """Assemble the database URL only in process memory from a Docker secret."""
+    password_file = os.getenv("DATABASE_PASSWORD_FILE")
+    if not password_file:
+        return os.getenv("DATABASE_URL")
+    password = Path(password_file).read_text(encoding="utf-8").strip()
+    if not password:
+        raise RuntimeError("Database password secret is empty")
+    user = quote(os.getenv("DATABASE_USER", "tradingagent"), safe="")
+    password = quote(password, safe="")
+    host = os.getenv("DATABASE_HOST", "postgres")
+    port = os.getenv("DATABASE_PORT", "5432")
+    name = quote(os.getenv("DATABASE_NAME", "tradingagent"), safe="")
+    return f"postgresql+psycopg://{user}:{password}@{host}:{port}/{name}"

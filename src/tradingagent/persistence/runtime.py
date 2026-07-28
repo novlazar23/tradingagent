@@ -1,15 +1,21 @@
 """Durable worker and scheduler loops over the shared jobs repository."""
 
+import hashlib
+import uuid
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from tradingagent.api.services import ApplicationRegistry
 from tradingagent.persistence.models import JobRecord, MarketDataset, PaperSession
 
 Progress = Callable[[int], None]
 Handler = Callable[[dict[str, object], Progress], dict[str, object] | None]
+
+
+class RetryableJobError(RuntimeError):
+    """Transient handler failure safe to retry after durable backoff."""
 
 
 class DurableJobWorker:
@@ -21,17 +27,29 @@ class DurableJobWorker:
         handlers: Mapping[str, Handler],
         *,
         maximum_retries: int = 3,
+        worker_id: str | None = None,
+        lease_duration: timedelta = timedelta(minutes=5),
+        retry_jitter: Callable[[str, int], float] | None = None,
     ) -> None:
         self.registry = registry
         self.handlers = handlers
         self.maximum_retries = maximum_retries
+        self.worker_id = worker_id or str(uuid.uuid4())
+        self.lease_duration = lease_duration
+        self.retry_jitter = retry_jitter or self._stable_jitter
 
     def run_once(self, *, now: datetime | None = None) -> bool:
         current = now or datetime.now(UTC)
         with self.registry.sessions.begin() as session:
             statement = (
                 select(JobRecord)
-                .where(JobRecord.status == "queued", JobRecord.available_at <= current)
+                .where(
+                    JobRecord.available_at <= current,
+                    or_(
+                        JobRecord.status == "queued",
+                        ((JobRecord.status == "running") & (JobRecord.lease_expires_at < current)),
+                    ),
+                )
                 .order_by(JobRecord.created_at)
                 .limit(1)
                 .with_for_update(skip_locked=True)
@@ -41,6 +59,8 @@ class DurableJobWorker:
                 return False
             job.status = "running"
             job.claimed_at = current
+            job.lease_owner = self.worker_id
+            job.lease_expires_at = current + self.lease_duration
             job.updated_at = current
             job_id = job.id
             kind = job.kind
@@ -60,22 +80,41 @@ class DurableJobWorker:
                     record.progress = value
                     record.updated_at = current
 
-        while True:
-            try:
-                result = handler(payload, progress)
-            except Exception as exc:
-                with self.registry.sessions.begin() as session:
-                    record = session.get(JobRecord, job_id)
-                    if record is None:
-                        return True
-                    if record.retry_count < min(record.maximum_retries, self.maximum_retries):
-                        record.retry_count += 1
-                        record.error_class = type(exc).__name__
-                        record.error_message = str(exc)[:1000]
-                        record.updated_at = current
-                        continue
-                self._fail(job_id, exc, current)
-                return True
+        try:
+            for attempt in range(self.maximum_retries + 1):
+                try:
+                    result = handler(payload, progress)
+                    break
+                except ConnectionError:
+                    if attempt >= self.maximum_retries:
+                        raise
+                    with self.registry.sessions.begin() as session:
+                        record = session.get(JobRecord, job_id)
+                        if record is not None:
+                            record.retry_count += 1
+                            record.updated_at = current
+        except RetryableJobError as exc:
+            with self.registry.sessions.begin() as session:
+                record = session.get(JobRecord, job_id)
+                if record is None:
+                    return True
+                if record.retry_count < min(record.maximum_retries, self.maximum_retries):
+                    record.retry_count += 1
+                    delay = 2**record.retry_count + self.retry_jitter(job_id, record.retry_count)
+                    record.status = "queued"
+                    record.available_at = current + timedelta(seconds=delay)
+                    record.error_class = type(exc).__name__
+                    record.error_message = "The operation will be retried"
+                    record.lease_owner = None
+                    record.lease_expires_at = None
+                    record.updated_at = current
+                    return True
+            self._fail(job_id, exc, current)
+            return True
+        except Exception as exc:
+            self._fail(job_id, exc, current)
+            return True
+        else:
             with self.registry.sessions.begin() as session:
                 record = session.get(JobRecord, job_id)
                 if record is not None:
@@ -84,8 +123,15 @@ class DurableJobWorker:
                     record.result = result
                     record.error_class = None
                     record.error_message = None
+                    record.lease_owner = None
+                    record.lease_expires_at = None
                     record.updated_at = current
             return True
+
+    @staticmethod
+    def _stable_jitter(job_id: str, attempt: int) -> float:
+        digest = hashlib.sha256(f"{job_id}:{attempt}".encode()).digest()
+        return int.from_bytes(digest[:2], "big") / 65535
 
     def _fail(self, job_id: str, error: Exception, now: datetime) -> None:
         with self.registry.sessions.begin() as session:
@@ -93,7 +139,9 @@ class DurableJobWorker:
             if record is not None:
                 record.status = "failed"
                 record.error_class = type(error).__name__
-                record.error_message = str(error)[:1000]
+                record.error_message = "The operation failed"
+                record.lease_owner = None
+                record.lease_expires_at = None
                 record.updated_at = now
 
 

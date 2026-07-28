@@ -25,6 +25,7 @@ class ErrorResponse(ApiModel):
 
 class DatasetList(ApiModel):
     datasets: list[dict[str, object]]
+    next_cursor: str | None = None
 
 
 class OperationRequest(ApiModel):

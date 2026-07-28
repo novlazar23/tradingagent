@@ -1,0 +1,98 @@
+x-app: &app
+  build: .
+  restart: unless-stopped
+  read_only: true
+  user: "10001:10001"
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  environment:
+    DATABASE_URL: postgresql+psycopg://tradingagent:${POSTGRES_PASSWORD:?required}@postgres/tradingagent
+    OCTOBOT_HISTORY_BASE_URL: ${OCTOBOT_HISTORY_BASE_URL:-http://192.168.178.20:5002}
+    OCTOBOT_HISTORY_API_KEY_FILE: /run/secrets/octobot_history_api_key
+  secrets:
+    - octobot_history_api_key
+  depends_on:
+    postgres:
+      condition: service_healthy
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  networks:
+    - backend
+    - history
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+  deploy:
+    resources:
+      limits:
+        memory: 1G
+        cpus: "1.0"
+
+services:
+  api:
+    <<: *app
+    command: ["tradingagent", "serve-api"]
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  worker:
+    <<: *app
+    command: ["tradingagent", "run-worker"]
+
+  scheduler:
+    <<: *app
+    command: ["tradingagent", "run-scheduler"]
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tradingagent
+      POSTGRES_USER: tradingagent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tradingagent -d tradingagent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+
+secrets:
+  octobot_history_api_key:
+    file: ${OCTOBOT_HISTORY_API_KEY_FILE:?required}
+
+volumes:
+  postgres-data:
+
+networks:
+  backend:
+    internal: true
+  history:
+    internal: false

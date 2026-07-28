@@ -168,7 +168,7 @@ class SignalDecisionRecord(Base):
         Index("ix_signal_decisions_session_time", "paper_session_id", "decided_at"),
         Index("ix_signal_decisions_page", "paper_session_id", "id"),
     )
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
     paper_session_id: Mapped[str | None] = mapped_column(ForeignKey("paper_sessions.id"))
     backtest_run_id: Mapped[str | None] = mapped_column(ForeignKey("backtest_runs.id"))
     candle_id: Mapped[str | None] = mapped_column(ForeignKey("candles.id"))
@@ -204,7 +204,7 @@ class OrderRecord(Base):
     session_id: Mapped[str] = mapped_column(
         ForeignKey("paper_sessions.id"), nullable=False, index=True
     )
-    decision_id: Mapped[str | None] = mapped_column(ForeignKey("signal_decisions.id"))
+    decision_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("signal_decisions.id"))
     side: Mapped[str] = mapped_column(String(4), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     quantity: Mapped[Decimal] = mapped_column(DECIMAL, nullable=False)

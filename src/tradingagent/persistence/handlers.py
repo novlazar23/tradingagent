@@ -399,10 +399,11 @@ class RuntimeHandlerFactory:
                 _aware(gap.start_time) < decision_time and _aware(gap.end_time) <= decision_time
                 for gap in gaps
             )
-            source_available = all(
-                any(_aware(row.close_time) <= decision_time for row in candles_by_timeframe[tf])
-                for tf in ("15m", "1h", "4h", "1d")
-            )
+            # A timeframe can legitimately have no candle visible yet while a
+            # new session catches up through the multi-timeframe warm-up
+            # window. The strategy sees only visible candles and returns HOLD;
+            # this is not a history-source outage.
+            source_available = _source_timeframes_available(candles_by_timeframe)
             portfolio = result.ledger.portfolio
             result = engine.process(
                 session_id,
@@ -527,6 +528,11 @@ def _rows_by_timeframe(
         )
         for timeframe in ("15m", "1h", "4h", "1d")
     }
+
+
+def _source_timeframes_available(candles_by_timeframe: Mapping[str, Sequence[Candle]]) -> bool:
+    """Return whether every required source timeframe exists in the persisted dataset."""
+    return all(candles_by_timeframe[timeframe] for timeframe in ("15m", "1h", "4h", "1d"))
 
 
 def _paper_execution_rows(

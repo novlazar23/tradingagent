@@ -58,7 +58,8 @@ def test_container_inputs_are_digest_pinned_and_dependency_install_is_frozen() -
     dockerfile = (ROOT / "Dockerfile").read_text()
     compose = (ROOT / "compose.yaml").read_text()
 
-    assert "python:3.12-slim@sha256:" in dockerfile
+    assert "python:3.12-alpine3.22@sha256:" in dockerfile
+    assert "RUN apk upgrade --no-cache" in dockerfile
     assert "uv sync --frozen" in dockerfile
     assert "postgres:17-alpine@sha256:" in compose
     assert "nginx:1.29-alpine@sha256:" in compose
@@ -88,6 +89,21 @@ def test_compose_mounts_secrets_with_least_privilege_metadata() -> None:
     assert 'uid: "10001"' in compose
     assert 'uid: "70"' in compose
     assert "mode: 0400" in compose
+
+
+def test_read_only_history_proxy_has_bounded_writable_cache() -> None:
+    compose = (ROOT / "compose.yaml").read_text()
+    proxy = compose.split("\n  history-proxy:\n", 1)[1].split("\n  postgres:\n", 1)[0]
+
+    assert "/var/cache/nginx:size=16m" in proxy
+
+
+def test_compose_e2e_uses_the_application_virtual_environment() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    e2e = (ROOT / "infra" / "ci_compose_workflow.py").read_text()
+
+    assert "exec -T api /app/.venv/bin/python /tmp/ci_compose_workflow.py" in workflow
+    assert "replace(hour=0, minute=0, second=0, microsecond=0)" in e2e
 
 
 def test_compose_renders_as_a_static_deployment_contract(tmp_path: Path) -> None:

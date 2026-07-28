@@ -302,7 +302,7 @@ def upgrade() -> None:
     op.create_index("ix_feature_values_candle", "feature_values", ["candle_id"], unique=False)
     op.create_table(
         "signal_decisions",
-        sa.Column("id", sa.String(length=36), nullable=False),
+        sa.Column("id", sa.String(length=64), nullable=False),
         sa.Column("paper_session_id", sa.String(length=36), nullable=True),
         sa.Column("backtest_run_id", sa.String(length=36), nullable=True),
         sa.Column("candle_id", sa.String(length=36), nullable=True),
@@ -338,7 +338,7 @@ def upgrade() -> None:
         "orders",
         sa.Column("id", sa.String(length=36), nullable=False),
         sa.Column("session_id", sa.String(length=36), nullable=False),
-        sa.Column("decision_id", sa.String(length=36), nullable=True),
+        sa.Column("decision_id", sa.String(length=64), nullable=True),
         sa.Column("side", sa.String(length=4), nullable=False),
         sa.Column("status", sa.String(length=16), nullable=False),
         sa.Column("quantity", sa.Numeric(precision=38, scale=18), nullable=False),

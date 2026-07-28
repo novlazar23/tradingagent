@@ -12,13 +12,24 @@ def test_cli_exposes_required_commands(capsys: object) -> None:
     except SystemExit as exc:
         assert exc.code == 0
     output = capsys.readouterr().out  # type: ignore[attr-defined]
-    for command in ("config", "data", "backtest", "paper", "db"):
+    for command in ("bootstrap", "config", "data", "backtest", "paper", "db"):
         assert command in output
 
 
 def test_cli_data_datasets_uses_application_service(capsys: object) -> None:
     assert main(["data", "datasets"]) == 0
     assert '"datasets": []' in capsys.readouterr().out  # type: ignore[attr-defined]
+
+
+def test_cli_source_datasets_reads_the_octobot_catalog(
+    monkeypatch: pytest.MonkeyPatch, capsys: object
+) -> None:
+    history = SimpleNamespace(list_datasets=lambda: ("one.data", "two.data"))
+    monkeypatch.setattr(cli, "_runtime_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(cli, "_runtime_history", lambda _config: history)
+
+    assert main(["data", "source-datasets"]) == 0
+    assert '"one.data"' in capsys.readouterr().out  # type: ignore[attr-defined]
 
 
 def test_cli_data_sync_passes_required_dataset_to_job(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -32,6 +43,38 @@ def test_cli_data_sync_passes_required_dataset_to_job(monkeypatch: pytest.Monkey
 
     assert main(["data", "sync", "--dataset-id", "btc"]) == 0
     assert captured == {"kind": "data_sync", "payload": {"dataset_id": "btc"}}
+
+
+def test_cli_bootstrap_requires_explicit_dataset_and_utc_range(
+    monkeypatch: pytest.MonkeyPatch, capsys: object
+) -> None:
+    captured: dict[str, object] = {}
+
+    def bootstrap(*_args: object, **kwargs: object) -> dict[str, str]:
+        captured.update(kwargs)
+        return {"dataset_id": "internal", "configuration_version": "version"}
+
+    monkeypatch.setattr(cli, "bootstrap_environment", bootstrap)
+    monkeypatch.setattr(cli, "_runtime_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(cli, "_runtime_history", lambda _config: object())
+
+    assert (
+        main(
+            [
+                "bootstrap",
+                "--external-dataset-id",
+                "btc.data",
+                "--start",
+                "2026-01-01T00:00:00Z",
+                "--end",
+                "2026-07-01T00:00:00Z",
+            ]
+        )
+        == 0
+    )
+    assert captured["external_dataset_id"] == "btc.data"
+    assert captured["start"].isoformat() == "2026-01-01T00:00:00+00:00"  # type: ignore[union-attr]
+    assert '"configuration_version": "version"' in capsys.readouterr().out  # type: ignore[attr-defined]
 
 
 def test_scheduler_uses_typed_paper_poll_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -77,7 +120,17 @@ def test_cli_paper_requires_explicit_subcommand() -> None:
     "argv",
     [
         ["config", "validate", "strategy.yaml"],
+        [
+            "bootstrap",
+            "--external-dataset-id",
+            "btc.data",
+            "--start",
+            "2026-01-01T00:00:00Z",
+            "--end",
+            "2026-07-01T00:00:00Z",
+        ],
         ["data", "datasets"],
+        ["data", "source-datasets"],
         ["data", "sync", "--dataset-id", "btc"],
         ["data", "gaps", "--dataset-id", "btc"],
         ["backtest", "run", "--dataset-id", "btc", "--configuration-version", "v1"],

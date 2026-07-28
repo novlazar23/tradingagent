@@ -14,6 +14,7 @@ from tradingagent.persistence.handlers import (
     _bounded_catch_up,
     _paper_execution_rows,
     _persist_candle_batch,
+    _source_timeframes_available,
     _strategy_request,
     _visible_candles,
 )
@@ -250,3 +251,10 @@ def test_paper_catch_up_fails_closed_instead_of_skipping_old_successors() -> Non
 
     with pytest.raises(ValueError, match="paper catch-up exceeds"):
         _bounded_catch_up(rows, maximum=2)
+
+
+def test_source_availability_distinguishes_dataset_presence_from_warm_up_visibility() -> None:
+    available = {timeframe: candles(timeframe, 1) for timeframe in STEPS}
+
+    assert _source_timeframes_available(available) is True
+    assert _source_timeframes_available({**available, "1d": ()}) is False

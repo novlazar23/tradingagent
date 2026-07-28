@@ -1,5 +1,6 @@
 """Persistence protocols and transactional PostgreSQL/in-memory adapters."""
 
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -222,7 +223,7 @@ class SQLAlchemyPaperRepository:
             if portfolio.cash:
                 db.add(
                     CashLedgerRecord(
-                        id=f"{session_id}:initial",
+                        id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"paper:{session_id}:initial")),
                         session_id=session_id,
                         entry_type="deposit",
                         asset="USDT",
@@ -412,7 +413,15 @@ class SQLAlchemyPaperRepository:
                 if key not in prior_entries:
                     db.add(
                         CashLedgerRecord(
-                            id=f"{entry.reference_id}:{entry.entry_type}:{entry.asset}:{index}",
+                            id=str(
+                                uuid.uuid5(
+                                    uuid.NAMESPACE_URL,
+                                    (
+                                        f"paper:{result.session.session_id}:ledger:"
+                                        f"{entry.reference_id}:{entry.entry_type}:{entry.asset}:{index}"
+                                    ),
+                                )
+                            ),
                             session_id=result.session.session_id,
                             entry_type=entry.entry_type,
                             asset=entry.asset,
@@ -441,7 +450,15 @@ class SQLAlchemyPaperRepository:
         ).all()
         seen_ids = {row.id for row in existing}
         for event in state.audit_events:
-            event_id = f"{state.session_id}:{event.event_type}:{event.occurred_at.timestamp()}"
+            event_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    (
+                        f"paper:{state.session_id}:audit:{event.event_type}:"
+                        f"{event.occurred_at.isoformat()}:{event.actor}:{event.details}"
+                    ),
+                )
+            )
             if event_id not in seen_ids:
                 db.add(
                     AuditEventRecord(

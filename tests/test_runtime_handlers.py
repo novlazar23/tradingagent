@@ -9,7 +9,13 @@ from tradingagent.config import CostConfig, RiskConfig
 from tradingagent.domain.models import Portfolio
 from tradingagent.paper.engine import PaperEngine
 from tradingagent.paper.repository import SQLAlchemyPaperRepository
-from tradingagent.persistence.models import Base, JobRecord, PaperSession
+from tradingagent.persistence.models import (
+    AuditEventRecord,
+    Base,
+    CashLedgerRecord,
+    JobRecord,
+    PaperSession,
+)
 from tradingagent.persistence.runtime import DurableJobWorker, LostJobLeaseError, RetryableJobError
 from tradingagent.persistence.snapshots import SnapshotResolver
 from tradingagent.trading.execution import ExecutionModel
@@ -67,23 +73,31 @@ def paper_engine(repository: SQLAlchemyPaperRepository) -> PaperEngine:
 def test_sqlalchemy_paper_repository_restores_full_lifecycle_state_after_restart() -> None:
     engine = database()
     first = SQLAlchemyPaperRepository(engine)
+    session_id = "11111111-1111-4111-8111-111111111111"
     first.create_session(
-        session_id="paper-1",
+        session_id=session_id,
         portfolio=Portfolio(Decimal("10000"), Decimal("0")),
         risk_state=SessionRiskState.initial(Decimal("10000")),
         configuration_versions=("strategy-v1", "cost-v1", "risk-v1"),
     )
-    started = paper_engine(first).start("paper-1", now=NOW)
+    started = paper_engine(first).start(session_id, now=NOW)
     paused = paper_engine(first).pause(
-        "paper-1", actor="operator", reason="maintenance", now=NOW + timedelta(seconds=1)
+        session_id, actor="operator", reason="maintenance", now=NOW + timedelta(seconds=1)
     )
 
-    restored = SQLAlchemyPaperRepository(engine).get("paper-1")
+    restored = SQLAlchemyPaperRepository(engine).get(session_id)
 
     assert started.status.value == "RUNNING"
     assert restored == paused
     assert restored.audit_events[-1].details == "maintenance"
     assert restored.configuration_versions == ("strategy-v1", "cost-v1", "risk-v1")
+    with first.sessions() as session:
+        initial_entry = session.scalar(select(CashLedgerRecord))
+        assert initial_entry is not None
+        assert len(initial_entry.id) == 36
+        audit_entries = session.scalars(select(AuditEventRecord)).all()
+        assert audit_entries
+        assert all(len(entry.id) == 36 for entry in audit_entries)
 
 
 def test_registry_lifecycle_transition_updates_complete_persisted_paper_state() -> None:

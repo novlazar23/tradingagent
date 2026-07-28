@@ -113,6 +113,7 @@ services:
       - ./infra/history-proxy.conf:/etc/nginx/nginx.conf:ro
     tmpfs:
       - /tmp:size=16m,mode=1777
+      - /var/cache/nginx:size=16m,uid=101,gid=101,mode=0700
     networks:
       - history-client
       - history-egress

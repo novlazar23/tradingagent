@@ -5,7 +5,7 @@ import json
 import subprocess
 import sys
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,7 @@ from tradingagent.api.services import ApplicationRegistry
 from tradingagent.config import AppConfig, database_url_from_environment
 from tradingagent.logging import configure_logging
 from tradingagent.market_data.adapter import OctoBotHistoryClient
+from tradingagent.persistence.bootstrap import bootstrap_environment
 from tradingagent.persistence.handlers import RuntimeHandlerFactory
 from tradingagent.persistence.runtime import DurableJobWorker, JobScheduler
 
@@ -31,6 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("serve-api", help="run the internal FastAPI service")
     commands.add_parser("run-worker", help="run the isolated background worker")
     commands.add_parser("run-scheduler", help="run the isolated scheduler")
+    bootstrap = commands.add_parser("bootstrap", help="register dataset and configuration")
+    bootstrap.add_argument("--external-dataset-id", required=True)
+    bootstrap.add_argument("--start", required=True)
+    bootstrap.add_argument("--end", required=True)
 
     config = commands.add_parser("config", help="configuration operations").add_subparsers(
         dest="action", required=True
@@ -42,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="action", required=True
     )
     data.add_parser("datasets")
+    data.add_parser("source-datasets")
     sync = data.add_parser("sync")
     sync.add_argument("--dataset-id", required=True)
     gaps = data.add_parser("gaps")
@@ -84,16 +90,19 @@ def _runtime_config() -> AppConfig:
     return AppConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
 
 
-def _runtime_handlers(config: AppConfig | None = None) -> dict[str, Any]:
-    config = config or _runtime_config()
-    history = OctoBotHistoryClient(
+def _runtime_history(config: AppConfig) -> OctoBotHistoryClient:
+    return OctoBotHistoryClient(
         str(config.deployment.history_base_url),
         config.deployment.history_api_key_file,
     )
+
+
+def _runtime_handlers(config: AppConfig | None = None) -> dict[str, Any]:
+    config = config or _runtime_config()
     return RuntimeHandlerFactory(
         REGISTRY,
         config=config,
-        history=history,
+        history=_runtime_history(config),
         code_version=__import__("os").environ.get("TRADINGAGENT_CODE_VERSION", "development"),
     ).handlers()
 
@@ -117,6 +126,19 @@ def main(argv: list[str] | None = None) -> int:
             scheduler.enqueue_due()
             scheduler.enqueue_data_syncs()
             time.sleep(config.deployment.paper_poll_seconds)
+    if args.command == "bootstrap":
+        config = _runtime_config()
+        result = bootstrap_environment(
+            REGISTRY,
+            _runtime_history(config),
+            config,
+            external_dataset_id=args.external_dataset_id,
+            start=datetime.fromisoformat(args.start.replace("Z", "+00:00")),
+            end=datetime.fromisoformat(args.end.replace("Z", "+00:00")),
+            code_version=__import__("os").environ.get("TRADINGAGENT_CODE_VERSION", "development"),
+        )
+        _print(result)
+        return 0
     if args.command == "config":
         payload = yaml.safe_load(args.path.read_text())
         AppConfig.model_validate(payload)
@@ -125,6 +147,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "data":
         if args.action == "datasets":
             _print({"datasets": REGISTRY.datasets})
+        elif args.action == "source-datasets":
+            config = _runtime_config()
+            _print({"datasets": _runtime_history(config).list_datasets()})
         elif args.action == "sync":
             _print(REGISTRY.create_job("data_sync", {"dataset_id": args.dataset_id}))
         else:

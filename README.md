@@ -24,7 +24,8 @@ curl http://127.0.0.1:8000/health/ready
 
 API, Worker und Scheduler besitzen kein direktes Egress-Netz. Historienabrufe
 laufen ausschließlich über einen Read-only-Proxy, der nur die zwei benötigten
-GET-Routen an den festen Upstream `192.168.178.20:5002` weiterleitet. Diese
+GET-Routen (`/health`, Datensätze und Kerzen) an den festen Upstream
+`192.168.178.20:5002` weiterleitet. Diese
 Grenze verhindert beliebige ausgehende Verbindungen der Anwendung, setzt aber
 weiterhin voraus, dass der konfigurierte OctoBot-Dienst und das lokale LAN
 vertrauenswürdig sind. Für eine nicht vertrauenswürdige Netzstrecke muss der
@@ -52,7 +53,10 @@ OpenAPI ist lokal unter `http://127.0.0.1:8000/docs` und
 Keys mit anderer Nutzlast ergibt `409 idempotency_conflict`.
 
 ```bash
+tradingagent bootstrap --external-dataset-id OCTOBOT_DATASET \
+  --start 2026-01-01T00:00:00Z --end 2026-07-01T00:00:00Z
 tradingagent config validate config.yaml
+tradingagent data source-datasets
 tradingagent data datasets
 tradingagent data sync --dataset-id DATASET
 tradingagent data gaps --dataset-id DATASET
@@ -65,6 +69,32 @@ tradingagent paper resume ID
 tradingagent paper stop ID
 tradingagent paper status ID
 tradingagent db migrate
+```
+
+Im Compose-Betrieb wird die CLI über den Worker ausgeführt, weil nur dieser
+Dienst Zugriff auf das OctoBot-Secret besitzt:
+
+```bash
+docker compose run --rm worker data source-datasets
+docker compose run --rm worker bootstrap \
+  --external-dataset-id ExchangeHistoryDataCollector_<id>.data \
+  --start 2026-01-01T00:00:00Z \
+  --end 2026-07-01T00:00:00Z
+```
+
+Die JSON-Ausgabe enthält `dataset_id` und `configuration_version`. Beide Werte
+werden anschließend explizit an Datenimport, Backtest und Paper-Session
+übergeben:
+
+```bash
+docker compose run --rm worker data sync --dataset-id DATASET_ID
+docker compose run --rm worker backtest run \
+  --dataset-id DATASET_ID --configuration-version CONFIGURATION_VERSION
+docker compose run --rm worker backtest report BACKTEST_ID
+docker compose run --rm worker paper create \
+  --dataset-id DATASET_ID --configuration-version CONFIGURATION_VERSION
+docker compose run --rm worker paper start PAPER_SESSION_ID
+docker compose run --rm worker paper status PAPER_SESSION_ID
 ```
 
 Strategie-, Risiko- und Kostenwerte besitzen bewusst keine fachlichen
@@ -87,10 +117,9 @@ docker compose restart worker scheduler
 docker compose run --rm api db migrate
 ```
 
-Idempotente Job- und Ledger-Persistenz ist die Voraussetzung für Recovery ohne
-doppelte Buchung. Die aktuelle In-Memory-Registry dient nur als
-Schnittstellenadapter und ist nicht für produktive Job-Recovery geeignet; vor
-Paper-Dauerbetrieb muss der PostgreSQL-Jobadapter aktiviert sein.
+Idempotente PostgreSQL-Job- und Ledger-Persistenz ermöglicht Recovery ohne
+doppelte Buchung. SQLite wird ausschließlich ohne konfigurierte Datenbank für
+lokale CLI- und Unit-Test-Ausführung verwendet; Compose nutzt PostgreSQL.
 
 ## Sicherheitsgrenzen
 

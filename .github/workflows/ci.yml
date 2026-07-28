@@ -169,7 +169,7 @@ jobs:
             test "$attempt" -lt 30
             sleep 2
           done
-          $compose exec -T api python /tmp/ci_compose_workflow.py exercise
+          $compose exec -T api /app/.venv/bin/python /tmp/ci_compose_workflow.py exercise
           $compose restart postgres api worker
           for attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:8000/health/ready >/dev/null; then
@@ -178,7 +178,7 @@ jobs:
             test "$attempt" -lt 30
             sleep 2
           done
-          $compose exec -T api python /tmp/ci_compose_workflow.py verify
+          $compose exec -T api /app/.venv/bin/python /tmp/ci_compose_workflow.py verify
           $compose up --detach scheduler
 
   image-security:

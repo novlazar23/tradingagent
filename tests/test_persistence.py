@@ -17,3 +17,11 @@ def test_foundation_schema_declares_versioned_configuration_and_ledger_tables() 
         "fills",
         "audit_events",
     } <= tables
+
+
+def test_signal_decision_hash_identifiers_fit_the_relational_schema() -> None:
+    decisions = Base.metadata.tables["signal_decisions"]
+    orders = Base.metadata.tables["orders"]
+
+    assert decisions.c.id.type.length == 64
+    assert orders.c.decision_id.type.length == 64

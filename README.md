@@ -23,7 +23,7 @@ curl http://127.0.0.1:8000/health/ready
 ```
 
 API, Worker und Scheduler besitzen kein direktes Egress-Netz. Historienabrufe
-laufen ausschließlich über einen Read-only-Proxy, der nur die zwei benötigten
+laufen ausschließlich über einen Read-only-Proxy, der nur die drei benötigten
 GET-Routen (`/health`, Datensätze und Kerzen) an den festen Upstream
 `192.168.178.20:5002` weiterleitet. Diese
 Grenze verhindert beliebige ausgehende Verbindungen der Anwendung, setzt aber

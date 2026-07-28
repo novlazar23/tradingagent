@@ -163,7 +163,8 @@ jobs:
           $compose build api worker scheduler migrate
           $compose up --detach history-stub history-proxy postgres migrate api worker
           for attempt in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:8000/health/ready >/dev/null; then
+            if $compose exec -T api /app/.venv/bin/python -c \
+              "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"; then
               break
             fi
             test "$attempt" -lt 30
@@ -172,7 +173,8 @@ jobs:
           $compose exec -T api /app/.venv/bin/python /tmp/ci_compose_workflow.py exercise
           $compose restart postgres api worker
           for attempt in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:8000/health/ready >/dev/null; then
+            if $compose exec -T api /app/.venv/bin/python -c \
+              "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"; then
               break
             fi
             test "$attempt" -lt 30

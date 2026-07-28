@@ -103,6 +103,8 @@ def test_compose_e2e_uses_the_application_virtual_environment() -> None:
     e2e = (ROOT / "infra" / "ci_compose_workflow.py").read_text()
 
     assert "exec -T api /app/.venv/bin/python /tmp/ci_compose_workflow.py" in workflow
+    assert "exec -T api /app/.venv/bin/python -c" in workflow
+    assert "curl --fail --silent http://127.0.0.1:8000/health/ready" not in workflow
     assert "replace(hour=0, minute=0, second=0, microsecond=0)" in e2e
 
 

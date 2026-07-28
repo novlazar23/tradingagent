@@ -15,7 +15,9 @@ from tradingagent.trading.pipeline import TradingPipeline
 from tradingagent.trading.risk import SessionRiskState
 from tradingagent.trading.strategy import DecisionAction, StrategyRequest
 
-StrategyCallback = Callable[[Sequence[Candle], bool], "BacktestOrderIntent | None"]
+StrategyCallback = Callable[
+    [Sequence[Candle], bool], "BacktestOrderIntent | StrategyRequest | None"
+]
 ZERO = Decimal(0)
 ONE = Decimal(1)
 

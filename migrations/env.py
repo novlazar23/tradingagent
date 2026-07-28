@@ -1,15 +1,14 @@
 """Alembic environment for the tradingagent schema."""
 
-import os
-
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from tradingagent.config import database_url_from_environment
 from tradingagent.persistence.models import Base
 
 config = context.config
 target_metadata = Base.metadata
-if database_url := os.getenv("DATABASE_URL"):
+if database_url := database_url_from_environment():
     config.set_main_option("sqlalchemy.url", database_url)
 
 

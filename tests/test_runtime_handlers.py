@@ -9,7 +9,7 @@ from tradingagent.config import CostConfig, RiskConfig
 from tradingagent.domain.models import Portfolio
 from tradingagent.paper.engine import PaperEngine
 from tradingagent.paper.repository import SQLAlchemyPaperRepository
-from tradingagent.persistence.models import Base, JobRecord
+from tradingagent.persistence.models import Base, JobRecord, PaperSession
 from tradingagent.persistence.runtime import DurableJobWorker, RetryableJobError
 from tradingagent.persistence.snapshots import SnapshotResolver
 from tradingagent.trading.execution import ExecutionModel
@@ -122,14 +122,73 @@ def test_expired_job_lease_is_reclaimed_after_worker_crash() -> None:
         worker_id="replacement",
         lease_duration=timedelta(minutes=1),
     )
-    assert worker.run_once(now=NOW) is True
+    assert worker.run_once(now=datetime.now(UTC)) is True
     assert registry.job(job.id).status == "completed"
+
+
+def test_progress_renews_lease_and_rejects_a_worker_that_lost_ownership() -> None:
+    engine = database()
+    registry = ApplicationRegistry(engine=engine)
+    job = registry.create_job("fenced")
+
+    def steal_lease(_payload, progress):
+        with registry.sessions.begin() as session:
+            row = session.get(JobRecord, job.id)
+            assert row is not None
+            row.lease_owner = "replacement"
+        progress(50)
+
+    worker = DurableJobWorker(
+        registry,
+        {"fenced": steal_lease},
+        worker_id="original",
+        lease_duration=timedelta(minutes=1),
+    )
+    assert worker.run_once(now=datetime.now(UTC)) is True
+    with registry.sessions() as session:
+        row = session.get(JobRecord, job.id)
+        assert row is not None
+        assert row.lease_owner == "replacement"
+        assert row.status == "running"
+
+
+def test_placeholder_paper_session_is_initialized_without_losing_request() -> None:
+    engine = database()
+    registry = ApplicationRegistry(engine=engine)
+    now = NOW
+    with registry.sessions.begin() as session:
+        session.add(
+            PaperSession(
+                id="paper-placeholder",
+                state="queued",
+                request={"dataset_id": "btc-history", "custom": "keep"},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    repository = SQLAlchemyPaperRepository(engine)
+    repository.create_session(
+        session_id="paper-placeholder",
+        portfolio=Portfolio(Decimal("10000"), Decimal("0")),
+        risk_state=SessionRiskState.initial(Decimal("10000")),
+        configuration_versions=("strategy-v1", "cost-v1", "risk-v1"),
+    )
+    with registry.sessions() as session:
+        row = session.get(PaperSession, "paper-placeholder")
+        assert row is not None
+        assert row.request["dataset_id"] == "btc-history"
+        assert row.request["custom"] == "keep"
+        assert "_state" in row.request
 
 
 def test_retryable_job_is_requeued_with_persisted_backoff_instead_of_busy_retry() -> None:
     engine = database()
     registry = ApplicationRegistry(engine=engine)
     job = registry.create_job("sync")
+    with registry.sessions.begin() as session:
+        row = session.get(JobRecord, job.id)
+        assert row is not None
+        row.available_at = NOW
 
     def transient(_payload, _progress):
         raise RetryableJobError("upstream unavailable")

@@ -229,7 +229,13 @@ class PositionRecord(Base):
 class CashLedgerRecord(Base):
     __tablename__ = "cash_ledger"
     __table_args__ = (
-        UniqueConstraint("session_id", "reference_id", "entry_type", name="uq_ledger_ref_type"),
+        UniqueConstraint(
+            "session_id",
+            "reference_id",
+            "entry_type",
+            "asset",
+            name="uq_ledger_ref_type_asset",
+        ),
         Index("ix_cash_ledger_session_time", "session_id", "occurred_at"),
         Index("ix_cash_ledger_page", "session_id", "id"),
     )

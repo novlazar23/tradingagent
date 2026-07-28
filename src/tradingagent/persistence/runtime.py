@@ -18,6 +18,10 @@ class RetryableJobError(RuntimeError):
     """Transient handler failure safe to retry after durable backoff."""
 
 
+class LostJobLeaseError(RuntimeError):
+    """The worker is fenced because another owner now holds the lease."""
+
+
 class DurableJobWorker:
     """Claim and execute one queued job with durable progress and bounded retries."""
 
@@ -30,6 +34,7 @@ class DurableJobWorker:
         worker_id: str | None = None,
         lease_duration: timedelta = timedelta(minutes=5),
         retry_jitter: Callable[[str, int], float] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.registry = registry
         self.handlers = handlers
@@ -37,9 +42,11 @@ class DurableJobWorker:
         self.worker_id = worker_id or str(uuid.uuid4())
         self.lease_duration = lease_duration
         self.retry_jitter = retry_jitter or self._stable_jitter
+        self.clock = clock or (lambda: datetime.now(UTC))
 
     def run_once(self, *, now: datetime | None = None) -> bool:
         current = now or datetime.now(UTC)
+        heartbeat_now: Callable[[], datetime] = (lambda: current) if now is not None else self.clock
         with self.registry.sessions.begin() as session:
             statement = (
                 select(JobRecord)
@@ -76,9 +83,17 @@ class DurableJobWorker:
                 raise ValueError("progress must be between 0 and 100")
             with self.registry.sessions.begin() as session:
                 record = session.get(JobRecord, job_id)
-                if record is not None:
-                    record.progress = value
-                    record.updated_at = current
+                renewed_at = heartbeat_now()
+                if (
+                    record is None
+                    or record.status != "running"
+                    or record.lease_owner != self.worker_id
+                    or self._lease_expired(record, renewed_at)
+                ):
+                    raise LostJobLeaseError(f"job lease lost: {job_id}")
+                record.progress = value
+                record.lease_expires_at = renewed_at + self.lease_duration
+                record.updated_at = renewed_at
 
         try:
             for attempt in range(self.maximum_retries + 1):
@@ -90,13 +105,28 @@ class DurableJobWorker:
                         raise
                     with self.registry.sessions.begin() as session:
                         record = session.get(JobRecord, job_id)
-                        if record is not None:
-                            record.retry_count += 1
-                            record.updated_at = current
+                        retry_at = heartbeat_now()
+                        if (
+                            record is None
+                            or record.status != "running"
+                            or record.lease_owner != self.worker_id
+                            or self._lease_expired(record, retry_at)
+                        ):
+                            raise LostJobLeaseError(f"job lease lost: {job_id}") from None
+                        record.retry_count += 1
+                        record.lease_expires_at = retry_at + self.lease_duration
+                        record.updated_at = retry_at
+        except LostJobLeaseError:
+            return True
         except RetryableJobError as exc:
             with self.registry.sessions.begin() as session:
                 record = session.get(JobRecord, job_id)
-                if record is None:
+                if (
+                    record is None
+                    or record.status != "running"
+                    or record.lease_owner != self.worker_id
+                    or self._lease_expired(record, current)
+                ):
                     return True
                 if record.retry_count < min(record.maximum_retries, self.maximum_retries):
                     record.retry_count += 1
@@ -117,15 +147,23 @@ class DurableJobWorker:
         else:
             with self.registry.sessions.begin() as session:
                 record = session.get(JobRecord, job_id)
-                if record is not None:
-                    record.status = "completed"
-                    record.progress = 100
-                    record.result = result
-                    record.error_class = None
-                    record.error_message = None
-                    record.lease_owner = None
-                    record.lease_expires_at = None
-                    record.updated_at = current
+                completed_at = heartbeat_now()
+                if (
+                    record is None
+                    or record.status != "running"
+                    or record.lease_owner != self.worker_id
+                    or self._lease_expired(record, completed_at)
+                ):
+                    return True
+                record.lease_expires_at = completed_at + self.lease_duration
+                record.status = "completed"
+                record.progress = 100
+                record.result = result
+                record.error_class = None
+                record.error_message = None
+                record.lease_owner = None
+                record.lease_expires_at = None
+                record.updated_at = completed_at
             return True
 
     @staticmethod
@@ -133,10 +171,24 @@ class DurableJobWorker:
         digest = hashlib.sha256(f"{job_id}:{attempt}".encode()).digest()
         return int.from_bytes(digest[:2], "big") / 65535
 
+    @staticmethod
+    def _lease_expired(record: JobRecord, now: datetime) -> bool:
+        expires = record.lease_expires_at
+        if expires is None:
+            return True
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=UTC)
+        return expires <= now
+
     def _fail(self, job_id: str, error: Exception, now: datetime) -> None:
         with self.registry.sessions.begin() as session:
             record = session.get(JobRecord, job_id)
-            if record is not None:
+            if (
+                record is not None
+                and record.status == "running"
+                and record.lease_owner == self.worker_id
+                and not self._lease_expired(record, now)
+            ):
                 record.status = "failed"
                 record.error_class = type(error).__name__
                 record.error_message = "The operation failed"

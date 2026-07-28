@@ -18,7 +18,6 @@ class StrictConfigModel(BaseModel):
 class DeploymentConfig(StrictConfigModel):
     """Runtime connectivity and paper-data freshness settings."""
 
-    database_url: str = Field(min_length=1)
     history_base_url: AnyHttpUrl
     history_api_key_file: str = Field(min_length=1)
     history_page_limit: int = Field(gt=0, le=500)
@@ -115,7 +114,7 @@ def database_url_from_environment() -> str | None:
     """Assemble the database URL only in process memory from a Docker secret."""
     password_file = os.getenv("DATABASE_PASSWORD_FILE")
     if not password_file:
-        return os.getenv("DATABASE_URL")
+        return None
     password = Path(password_file).read_text(encoding="utf-8").strip()
     if not password:
         raise RuntimeError("Database password secret is empty")

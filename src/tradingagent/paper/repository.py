@@ -1,5 +1,6 @@
 """Persistence protocols and transactional PostgreSQL/in-memory adapters."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -13,6 +14,7 @@ from tradingagent.paper.models import (
     PaperCheckpoint,
     PaperOrder,
     PaperSessionState,
+    PendingOrderIntent,
     ProcessedCandle,
     SessionAuditEvent,
     SessionStatus,
@@ -74,6 +76,30 @@ def _state_payload(state: PaperSessionState) -> dict[str, object]:
         "take_profit_price": (
             str(state.take_profit_price) if state.take_profit_price is not None else None
         ),
+        "pending_intent": (
+            {
+                "decision_id": state.pending_intent.decision_id,
+                "risk_check_id": state.pending_intent.risk_check_id,
+                "action": state.pending_intent.action,
+                "quantity": str(state.pending_intent.quantity),
+                "decided_at": state.pending_intent.decided_at.isoformat(),
+                "stop_price": (
+                    str(state.pending_intent.stop_price)
+                    if state.pending_intent.stop_price is not None
+                    else None
+                ),
+                "take_profit_price": (
+                    str(state.pending_intent.take_profit_price)
+                    if state.pending_intent.take_profit_price is not None
+                    else None
+                ),
+                "atr": (
+                    str(state.pending_intent.atr) if state.pending_intent.atr is not None else None
+                ),
+            }
+            if state.pending_intent
+            else None
+        ),
     }
 
 
@@ -102,6 +128,23 @@ def _risk(payload: dict[str, Any]) -> SessionRiskState:
     )
 
 
+def _pending_intent(payload: object) -> PendingOrderIntent | None:
+    if not isinstance(payload, dict):
+        return None
+    return PendingOrderIntent(
+        decision_id=str(payload["decision_id"]),
+        risk_check_id=str(payload["risk_check_id"]),
+        action=str(payload["action"]),
+        quantity=Decimal(str(payload["quantity"])),
+        decided_at=datetime.fromisoformat(str(payload["decided_at"])),
+        stop_price=(Decimal(str(payload["stop_price"])) if payload.get("stop_price") else None),
+        take_profit_price=(
+            Decimal(str(payload["take_profit_price"])) if payload.get("take_profit_price") else None
+        ),
+        atr=Decimal(str(payload["atr"])) if payload.get("atr") else None,
+    )
+
+
 class PaperRepository(Protocol):
     """Transaction boundary expected from a PostgreSQL paper repository."""
 
@@ -114,8 +157,11 @@ class PaperRepository(Protocol):
 class SQLAlchemyPaperRepository:
     """Map complete paper state to normalized records in one DB transaction."""
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(
+        self, engine: Engine, *, failure_injector: Callable[[str], None] | None = None
+    ) -> None:
         self.sessions = sessionmaker(engine, expire_on_commit=False)
+        self.failure_injector = failure_injector or (lambda _stage: None)
 
     def create_session(
         self,
@@ -140,17 +186,25 @@ class SQLAlchemyPaperRepository:
         )
         now = datetime.now(UTC)
         with self.sessions.begin() as db:
-            if db.get(PaperSession, session_id) is not None:
+            paper = db.get(PaperSession, session_id)
+            if paper is not None and "_state" in paper.request:
                 raise ValueError("session_id already exists")
-            db.add(
-                PaperSession(
+            if paper is None:
+                paper = PaperSession(
                     id=session_id,
                     state=state.status.value.lower(),
                     request={**(request or {}), "_state": _state_payload(state)},
                     created_at=now,
                     updated_at=now,
                 )
-            )
+                db.add(paper)
+            else:
+                preserved = dict(paper.request)
+                preserved.update(request or {})
+                preserved["_state"] = _state_payload(state)
+                paper.request = preserved
+                paper.state = state.status.value.lower()
+                paper.updated_at = now
             db.add(
                 PositionRecord(
                     session_id=session_id,
@@ -263,6 +317,7 @@ class SQLAlchemyPaperRepository:
                 Decimal(str(runtime["take_profit_price"]))
                 if runtime.get("take_profit_price")
                 else None,
+                _pending_intent(runtime.get("pending_intent")),
             )
 
     def save(self, state: PaperSessionState) -> PaperSessionState:
@@ -305,6 +360,8 @@ class SQLAlchemyPaperRepository:
                     decided_at=decision.decision_time,
                 )
             )
+            db.flush()
+            self.failure_injector("after_decision")
             if result.order and result.fill:
                 fill = result.fill
                 db.add(
@@ -319,6 +376,8 @@ class SQLAlchemyPaperRepository:
                         idempotency_key=f"{result.session.session_id}:{checkpoint.candle_id}",
                     )
                 )
+                db.flush()
+                self.failure_injector("after_order")
                 db.add(
                     FillRecord(
                         id=fill.fill_id,
@@ -330,6 +389,8 @@ class SQLAlchemyPaperRepository:
                         occurred_at=checkpoint.candle_close_time,
                     )
                 )
+                db.flush()
+                self.failure_injector("after_fill")
             prior_entries = {
                 row.reference_id + ":" + row.entry_type + ":" + row.asset
                 for row in db.scalars(

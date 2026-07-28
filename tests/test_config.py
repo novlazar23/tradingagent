@@ -1,15 +1,15 @@
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
-from tradingagent.config import AppConfig
+from tradingagent.config import AppConfig, database_url_from_environment
 
 
 def valid_config() -> dict[str, object]:
     return {
         "deployment": {
-            "database_url": "postgresql+psycopg://agent:secret@postgres/agent",
             "history_base_url": "http://192.168.178.20:5002",
             "history_api_key_file": "/run/secrets/octobot_history_api_key",
             "history_page_limit": 500,
@@ -99,3 +99,28 @@ def test_configuration_preserves_decimal_values() -> None:
 
     assert config.risk.initial_capital == Decimal("10000")
     assert isinstance(config.costs.taker_fee_rate, Decimal)
+
+
+def test_database_url_never_accepts_plaintext_environment_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DATABASE_PASSWORD_FILE", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://agent:plaintext@db/agent")
+
+    assert database_url_from_environment() is None
+
+
+def test_database_url_is_assembled_only_from_secret_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    secret = tmp_path / "postgres-password"
+    secret.write_text("s/ecret\n", encoding="utf-8")
+    monkeypatch.setenv("DATABASE_PASSWORD_FILE", str(secret))
+    monkeypatch.setenv("DATABASE_USER", "agent")
+    monkeypatch.setenv("DATABASE_HOST", "database")
+    monkeypatch.setenv("DATABASE_PORT", "5433")
+    monkeypatch.setenv("DATABASE_NAME", "trading")
+
+    assert database_url_from_environment() == (
+        "postgresql+psycopg://agent:s%2Fecret@database:5433/trading"
+    )

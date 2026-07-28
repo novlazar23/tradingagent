@@ -11,6 +11,7 @@ from tradingagent.paper.models import (
     PaperCycle,
     PaperOrder,
     PaperSessionState,
+    PendingOrderIntent,
     ProcessedCandle,
     SessionAuditEvent,
     SessionStatus,
@@ -106,7 +107,6 @@ class PaperEngine:
             cycle.observed_at,
         )
         session = replace(session, risk_state=observed_risk)
-        self.repository.save(session)
         if observed_risk.paused:
             return self._transition(
                 session,
@@ -117,10 +117,47 @@ class PaperEngine:
                 cycle.observed_at,
             )
 
-        protective_reason, protective_price = self._protective_trigger(session, cycle)
+        order: PaperOrder | None = None
+        fill: SimulatedFill | None = None
+        updated = session
+        pending = session.pending_intent
+        if pending is not None and cycle.candle_close_time > pending.decided_at:
+            side = (
+                OrderSide.BUY
+                if pending.action == DecisionAction.ENTER_LONG.value
+                else OrderSide.SELL
+            )
+            order, fill, updated = self._execute(
+                session,
+                cycle,
+                pending.decision_id,
+                pending.risk_check_id,
+                side,
+                pending.quantity,
+                reference_price=cycle.candle_open,
+                atr=pending.atr,
+            )
+            if side is OrderSide.BUY:
+                updated = replace(
+                    updated,
+                    risk_state=self.risk.record_entry(updated.risk_state, cycle.observed_at),
+                    stop_price=pending.stop_price,
+                    take_profit_price=pending.take_profit_price,
+                    pending_intent=None,
+                )
+            else:
+                updated = replace(
+                    updated,
+                    risk_state=self.risk.record_exit(updated.risk_state, cycle.observed_at),
+                    stop_price=None,
+                    take_profit_price=None,
+                    pending_intent=None,
+                )
+
+        protective_reason, protective_price = self._protective_trigger(updated, cycle)
         request = replace(
             cycle.strategy_request,
-            has_position=session.ledger.portfolio.btc > 0,
+            has_position=updated.ledger.portfolio.btc > 0,
             forced_exit_reasons=(
                 (*cycle.strategy_request.forced_exit_reasons, protective_reason)
                 if protective_reason is not None
@@ -129,53 +166,66 @@ class PaperEngine:
         )
         plan = self.pipeline.plan(
             request=request,
-            portfolio=session.ledger.portfolio,
-            risk_state=session.risk_state,
+            portfolio=updated.ledger.portfolio,
+            risk_state=updated.risk_state,
             reference_price=cycle.reference_price,
             atr=cycle.atr,
             now=cycle.observed_at,
         )
         decision = plan.decision
-        order: PaperOrder | None = None
-        fill: SimulatedFill | None = None
-        updated = session
         if decision.action is DecisionAction.ENTER_LONG:
             assert plan.approval is not None
             approval = plan.approval
             if approval.approved:
-                order, fill, updated = self._execute(
-                    session,
-                    cycle,
-                    decision.decision_id,
-                    approval.risk_check_id,
-                    OrderSide.BUY,
-                    approval.quantity,
-                )
                 updated = replace(
                     updated,
-                    risk_state=self.risk.record_entry(updated.risk_state, cycle.observed_at),
-                    stop_price=approval.stop_price,
-                    take_profit_price=approval.take_profit_price,
+                    pending_intent=PendingOrderIntent(
+                        decision.decision_id,
+                        approval.risk_check_id,
+                        decision.action.value,
+                        approval.quantity,
+                        cycle.candle_close_time,
+                        approval.stop_price,
+                        approval.take_profit_price,
+                        cycle.atr,
+                    ),
                 )
-        elif decision.action is DecisionAction.EXIT_LONG and session.ledger.portfolio.btc > 0:
+        elif decision.action is DecisionAction.EXIT_LONG and updated.ledger.portfolio.btc > 0:
             assert plan.approval is not None
             approval = plan.approval
             if approval.approved:
-                order, fill, updated = self._execute(
-                    session,
-                    cycle,
-                    decision.decision_id,
-                    approval.risk_check_id,
-                    OrderSide.SELL,
-                    approval.quantity,
-                    reference_price=protective_price,
-                )
                 updated = replace(
                     updated,
-                    risk_state=self.risk.record_exit(updated.risk_state, cycle.observed_at),
-                    stop_price=None,
-                    take_profit_price=None,
+                    pending_intent=PendingOrderIntent(
+                        decision.decision_id,
+                        approval.risk_check_id,
+                        decision.action.value,
+                        approval.quantity,
+                        cycle.candle_close_time,
+                        None,
+                        None,
+                        cycle.atr,
+                    ),
                 )
+        if protective_reason is not None and updated.ledger.portfolio.btc > 0:
+            # Protective exits are deliberately immediate, matching backtest intrabar
+            # stop/target handling rather than the close-time signal queue.
+            order, fill, updated = self._execute(
+                updated,
+                cycle,
+                decision.decision_id,
+                plan.approval.risk_check_id if plan.approval else decision.decision_id,
+                OrderSide.SELL,
+                updated.ledger.portfolio.btc,
+                reference_price=protective_price,
+            )
+            updated = replace(
+                updated,
+                risk_state=self.risk.record_exit(updated.risk_state, cycle.observed_at),
+                stop_price=None,
+                take_profit_price=None,
+                pending_intent=None,
+            )
         checkpoint = PaperCheckpoint(
             cycle.candle_id,
             cycle.candle_close_time,
@@ -195,6 +245,7 @@ class PaperEngine:
         side: OrderSide,
         quantity: Decimal,
         reference_price: Decimal | None = None,
+        atr: Decimal | None = None,
     ) -> tuple[PaperOrder, SimulatedFill, PaperSessionState]:
         order_id = sha256(
             f"{session.session_id}:{cycle.candle_id}:{decision_id}:{side}".encode()
@@ -204,7 +255,7 @@ class PaperEngine:
             side=side,
             reference_price=reference_price or cycle.reference_price,
             requested_quantity=quantity,
-            atr=cycle.atr,
+            atr=atr if atr is not None else cycle.atr,
             fill_id=fill_id,
             decision_id=decision_id,
             risk_check_id=risk_check_id,

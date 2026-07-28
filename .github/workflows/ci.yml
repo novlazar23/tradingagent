@@ -8,53 +8,159 @@ permissions:
   contents: read
 
 jobs:
-  quality-and-tests:
+  quality:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        timezone: [UTC, Europe/Berlin]
+    env:
+      TZ: ${{ matrix.timezone }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.22"
+          enable-cache: true
+      - run: uv sync --frozen --extra dev
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy src
+      - run: uv run pytest --cov=tradingagent --cov-report=term-missing --cov-fail-under=85
+
+  dependency-audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
-          enable-cache: true
-      - run: uv sync --frozen
-      - name: Format
-        run: uv run ruff format --check .
-      - name: Lint
-        run: uv run ruff check .
-      - name: Types
-        run: uv run mypy
-      - name: Unit, property, contract and integration tests
-        run: uv run pytest -q
-      - name: Compose configuration
+          version: "0.8.22"
+      - name: Audit the locked production dependency set
         run: |
-          printf 'ci-placeholder\n' > /tmp/tradingagent-history-key
-          printf 'ci-placeholder\n' > /tmp/tradingagent-postgres-password
-          OCTOBOT_HISTORY_API_KEY_FILE=/tmp/tradingagent-history-key \
-          POSTGRES_PASSWORD_FILE=/tmp/tradingagent-postgres-password \
-          docker compose config --quiet
-      - name: Python dependency audit
-        run: uvx pip-audit
+          uv export --frozen --no-dev --no-emit-project --output-file requirements.lock
+          uvx --from pip-audit==2.9.0 pip-audit --requirement requirements.lock
 
-  container-security:
+  postgres-integration:
     runs-on: ubuntu-latest
-    needs: quality-and-tests
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: tradingagent
+          POSTGRES_USER: tradingagent
+          POSTGRES_PASSWORD: integration-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tradingagent -d tradingagent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_PASSWORD_FILE: ${{ github.workspace }}/.ci-postgres-password
+      DATABASE_HOST: 127.0.0.1
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: tradingagent
+      DATABASE_USER: tradingagent
     steps:
       - uses: actions/checkout@v4
-      - name: Build image
-        run: docker build -t tradingagent:ci .
-      - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@0.32.0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.22"
+      - run: uv sync --frozen --extra dev
+      - name: Migrate empty PostgreSQL database
+        run: |
+          printf '%s' 'integration-only' > "$DATABASE_PASSWORD_FILE"
+          chmod 600 "$DATABASE_PASSWORD_FILE"
+          uv run alembic upgrade head
+          uv run alembic current --check-heads
+          uv run alembic check
+      - name: Verify schema and readiness
+        run: |
+          uv run python - <<'PY'
+          from tradingagent.api.services import ApplicationRegistry
+          from tradingagent.config import database_url_from_environment
+          url = database_url_from_environment()
+          assert url is not None
+          status, dependencies = ApplicationRegistry.from_database_url(url).readiness()
+          assert status in {"ok", "degraded"}, (status, dependencies)
+          assert dependencies["migrations"] == "current"
+          PY
+      - name: Generate deterministic OpenAPI artifact
+        run: |
+          mkdir -p artifacts
+          uv run python - <<'PY'
+          import json
+          from pathlib import Path
+          from tradingagent.api.app import create_app
+          schema = create_app().openapi()
+          assert schema["openapi"].startswith("3.")
+          assert "/health/ready" in schema["paths"]
+          Path("artifacts/openapi.json").write_text(
+              json.dumps(schema, sort_keys=True, separators=(",", ":")) + "\n"
+          )
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openapi
+          path: artifacts/openapi.json
+
+  compose-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare local-only Compose inputs
+        run: |
+          mkdir -p .ci-secrets
+          printf '%s' 'history-integration-only' > .ci-secrets/history
+          printf '%s' 'postgres-integration-only' > .ci-secrets/postgres
+          cp config.example.yaml .ci-config.yaml
+      - name: Build, start, restart and verify the hardened stack
+        env:
+          OCTOBOT_HISTORY_API_KEY_FILE: ${{ github.workspace }}/.ci-secrets/history
+          POSTGRES_PASSWORD_FILE: ${{ github.workspace }}/.ci-secrets/postgres
+          TRADINGAGENT_CONFIG_FILE: ${{ github.workspace }}/.ci-config.yaml
+        run: |
+          trap 'docker compose logs --no-color; docker compose down --volumes' EXIT
+          docker compose config --quiet
+          docker compose build api worker scheduler migrate
+          docker compose up --detach postgres migrate api worker scheduler
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8000/health/ready >/dev/null; then
+              break
+            fi
+            test "$attempt" -lt 30
+            sleep 2
+          done
+          docker compose exec -T postgres psql -U tradingagent -d tradingagent \
+            -c 'CREATE TABLE ci_persistence_probe (value integer NOT NULL); INSERT INTO ci_persistence_probe VALUES (1);'
+          docker compose restart postgres api worker scheduler
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8000/health/ready >/dev/null; then
+              break
+            fi
+            test "$attempt" -lt 30
+            sleep 2
+          done
+          test "$(docker compose exec -T postgres psql -At -U tradingagent -d tradingagent \
+            -c 'SELECT value FROM ci_persistence_probe')" = "1"
+
+  image-security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release-equivalent image
+        run: docker build --tag tradingagent:ci .
+      - name: Scan image with trivy
+        uses: aquasecurity/trivy-action@0.30.0
         with:
           image-ref: tradingagent:ci
-          severity: CRITICAL,HIGH
+          format: table
           exit-code: "1"
+          severity: HIGH,CRITICAL
           ignore-unfixed: true
-      - name: Generate SPDX SBOM with syft
+      - name: Generate syft SBOM
         uses: anchore/sbom-action@v0
         with:
           image: tradingagent:ci
-          format: spdx-json
-          output-file: tradingagent.spdx.json
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tradingagent-sbom
-          path: tradingagent.spdx.json
+          artifact-name: tradingagent.spdx.json

@@ -15,6 +15,9 @@ x-app: &app
     DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
     OCTOBOT_HISTORY_BASE_URL: http://history-proxy:8080
     OCTOBOT_HISTORY_API_KEY_FILE: /run/secrets/octobot_history_api_key
+    TRADINGAGENT_CONFIG: /app/config/config.yaml
+  volumes:
+    - ${TRADINGAGENT_CONFIG_FILE:-./config.yaml}:/app/config/config.yaml:ro
   secrets:
     - octobot_history_api_key
     - postgres_password

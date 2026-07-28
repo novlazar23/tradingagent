@@ -60,6 +60,7 @@ class PaperCycle:
     candle_id: str
     candle_close_time: datetime
     observed_at: datetime
+    candle_open: Decimal
     reference_price: Decimal
     candle_low: Decimal
     candle_high: Decimal
@@ -71,8 +72,8 @@ class PaperCycle:
         for value in (self.candle_close_time, self.observed_at):
             if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
                 raise ValueError("paper cycle timestamps must be timezone-aware UTC")
-        if not self.candle_id or self.reference_price <= 0:
-            raise ValueError("candle_id and positive reference_price are required")
+        if not self.candle_id or self.reference_price <= 0 or self.candle_open <= 0:
+            raise ValueError("candle_id and positive prices are required")
         if self.candle_close_time > self.observed_at:
             raise ValueError("candle close must be observed before processing")
         if self.strategy_request.decision_time != self.candle_close_time:
@@ -90,6 +91,20 @@ class PaperCheckpoint:
     decision_id: str
     order_id: str | None
     fill_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingOrderIntent:
+    """Approved close-time decision awaiting the next candle open."""
+
+    decision_id: str
+    risk_check_id: str
+    action: str
+    quantity: Decimal
+    decided_at: datetime
+    stop_price: Decimal | None
+    take_profit_price: Decimal | None
+    atr: Decimal | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +131,7 @@ class PaperSessionState:
     audit_events: tuple[SessionAuditEvent, ...]
     stop_price: Decimal | None = None
     take_profit_price: Decimal | None = None
+    pending_intent: PendingOrderIntent | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,18 +2,25 @@
 
 import json
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from hashlib import sha256
 from typing import Literal, cast
 
 from sqlalchemy import select
 
 from tradingagent.api.services import ApplicationRegistry
 from tradingagent.backtest import BacktestConfig, BacktestEngine
-from tradingagent.config import AppConfig
+from tradingagent.config import AppConfig, StrategyConfig
 from tradingagent.domain.models import Candle, Portfolio
+from tradingagent.features import (
+    IndicatorConfig,
+    PatternConfig,
+    PatternEngine,
+    calculate_indicators,
+)
 from tradingagent.market_data.adapter import OctoBotHistoryClient
 from tradingagent.market_data.timeframes import parse_timeframe
 from tradingagent.paper import CandleHealth, PaperCycle, PaperEngine
@@ -29,8 +36,13 @@ from tradingagent.persistence.models import (
 )
 from tradingagent.persistence.snapshots import ResolvedSnapshot, SnapshotResolver
 from tradingagent.trading.execution import ExecutionModel
+from tradingagent.trading.pipeline import TradingPipeline
 from tradingagent.trading.risk import RiskEngine, SessionRiskState
-from tradingagent.trading.strategy import StrategyEngine, StrategyRequest
+from tradingagent.trading.strategy import (
+    SignalContribution,
+    StrategyEngine,
+    StrategyRequest,
+)
 
 
 def _json(value: object) -> object:
@@ -165,16 +177,23 @@ class RuntimeHandlerFactory:
                 select(CandleRecord)
                 .where(
                     CandleRecord.dataset_id == dataset_id,
-                    CandleRecord.timeframe == "15m",
                     CandleRecord.is_closed.is_(True),
                 )
-                .order_by(CandleRecord.open_time)
+                .order_by(CandleRecord.close_time)
             ).all()
-        candles = tuple(_domain_candle(row) for row in rows)
+            gaps = db.scalars(select(DataGap).where(DataGap.dataset_id == dataset_id)).all()
+        candles_by_timeframe = _rows_by_timeframe(rows)
+        candles = candles_by_timeframe["15m"]
+        source_data_fingerprint = _data_fingerprint(rows)
         if len(candles) < 2:
             raise ValueError("backtest requires at least two persisted 15m candles")
         progress(20)
         execution = ExecutionModel(resolved.configuration.costs)
+        pipeline = TradingPipeline(
+            StrategyEngine(),
+            RiskEngine(resolved.configuration.risk),
+            execution,
+        )
         engine = BacktestEngine(
             execution_model=execution,
             config=BacktestConfig(
@@ -184,8 +203,19 @@ class RuntimeHandlerFactory:
                     resolved.configuration.strategy.model_dump(mode="json"), sort_keys=True
                 ),
             ),
+            pipeline=pipeline,
         )
-        report = engine.run(candles, lambda _history, _position: None)
+        report = engine.run(
+            candles,
+            lambda history, position: _strategy_request(
+                strategy=resolved.configuration.strategy,
+                candles_by_timeframe=candles_by_timeframe,
+                rows=rows,
+                decision_time=history[-1].close_time,
+                has_position=position,
+                gaps=gaps,
+            ),
+        )
         progress(80)
         serialized = _json(asdict(report))
         with self.registry.sessions.begin() as db:
@@ -196,7 +226,17 @@ class RuntimeHandlerFactory:
                 "report": serialized,
                 "configuration_fingerprint": resolved.configuration_fingerprint,
                 "code_fingerprint": resolved.code_fingerprint,
-                "data_fingerprint": report.snapshot.data_fingerprint,
+                "data_fingerprint": source_data_fingerprint,
+                "execution_data_fingerprint": report.snapshot.data_fingerprint,
+                "lineage": {
+                    "dataset_id": dataset_id,
+                    "strategy_definition_id": resolved.strategy_definition_id,
+                    "configuration_snapshot_id": resolved.snapshot_id,
+                    "configuration_fingerprint": resolved.configuration_fingerprint,
+                    "code_fingerprint": resolved.code_fingerprint,
+                    "data_fingerprint": source_data_fingerprint,
+                    "execution_data_fingerprint": report.snapshot.data_fingerprint,
+                },
             }
             run.updated_at = datetime.now(UTC)
             db.add(
@@ -218,7 +258,7 @@ class RuntimeHandlerFactory:
                         payload=None if isinstance(value, Decimal) else {"value": value},
                     )
                 )
-        return {"backtest_id": run_id, "data_fingerprint": report.snapshot.data_fingerprint}
+        return {"backtest_id": run_id, "data_fingerprint": source_data_fingerprint}
 
     def paper_create(
         self, payload: dict[str, object], progress: Callable[[int], None]
@@ -227,16 +267,6 @@ class RuntimeHandlerFactory:
         resolved = self.snapshots.get(
             str(payload["configuration_version"]), code_version=self.code_version
         )
-        with self.registry.sessions.begin() as db:
-            placeholder = db.get(
-                __import__(
-                    "tradingagent.persistence.models", fromlist=["PaperSession"]
-                ).PaperSession,
-                session_id,
-            )
-            request = dict(placeholder.request) if placeholder is not None else {}
-            if placeholder is not None:
-                db.delete(placeholder)
         self.paper_repository.create_session(
             session_id=session_id,
             portfolio=Portfolio(resolved.configuration.risk.initial_capital, Decimal(0)),
@@ -246,7 +276,6 @@ class RuntimeHandlerFactory:
                 resolved.snapshot_id,
                 resolved.code_fingerprint,
             ),
-            request=request,
         )
         progress(100)
         return {"paper_session_id": session_id}
@@ -273,45 +302,64 @@ class RuntimeHandlerFactory:
             if snapshot is None or paper is None:
                 raise ValueError("paper lineage is incomplete")
             dataset_id = str(paper.request.get("dataset_id", payload.get("dataset_id", "")))
-            candle = db.scalar(
+            rows = db.scalars(
                 select(CandleRecord)
                 .where(
                     CandleRecord.dataset_id == dataset_id,
-                    CandleRecord.timeframe == "15m",
                     CandleRecord.is_closed.is_(True),
                 )
-                .order_by(CandleRecord.open_time.desc())
-            )
+                .order_by(CandleRecord.close_time)
+            ).all()
+            gaps = db.scalars(select(DataGap).where(DataGap.dataset_id == dataset_id)).all()
+        candles_by_timeframe = _rows_by_timeframe(rows)
+        execution_rows = [row for row in rows if row.timeframe == "15m"]
+        candle = execution_rows[-1] if execution_rows else None
         if candle is None:
             raise ValueError("no closed 15m candle available")
         resolved = self.snapshots.resolve(snapshot.payload, code_version=self.code_version)
-        strategy = resolved.configuration.strategy
         decision_time = _aware(candle.close_time)
-        request = StrategyRequest(
+        request = _strategy_request(
+            strategy=resolved.configuration.strategy,
+            candles_by_timeframe=candles_by_timeframe,
+            rows=rows,
             decision_time=decision_time,
-            strategy_version=strategy.version,
-            contributions=(),
-            group_weights={},
-            timeframe_weights=cast(Mapping[str, Decimal], strategy.timeframe_weights),
-            entry_threshold=strategy.entry_threshold,
-            exit_threshold=strategy.exit_threshold,
-            minimum_confidence=strategy.minimum_confidence,
-            minimum_confirming_groups=strategy.minimum_confirming_groups,
             has_position=state.ledger.portfolio.btc > 0,
+            gaps=gaps,
         )
+        matching_gap = any(
+            _aware(gap.start_time) < decision_time and _aware(gap.end_time) <= decision_time
+            for gap in gaps
+        )
+        source_available = all(
+            any(candle.close_time <= decision_time for candle in candles_by_timeframe[tf])
+            for tf in ("15m", "1h", "4h", "1d")
+        )
+        observed_at = datetime.now(UTC)
+        clock_drift = observed_at < decision_time
+        portfolio = state.ledger.portfolio
+        ledger_consistent = portfolio.cash >= 0 and portfolio.btc >= 0
         engine = self._paper_engine(resolved)
         result = engine.process(
             session_id,
             PaperCycle(
                 candle_id=candle.id,
                 candle_close_time=decision_time,
-                observed_at=datetime.now(UTC),
+                observed_at=observed_at,
+                candle_open=candle.open,
                 reference_price=candle.close,
                 candle_low=candle.low,
                 candle_high=candle.high,
-                atr=None,
+                atr=_latest_atr(
+                    candles_by_timeframe["15m"],
+                    resolved.configuration.strategy.indicator_parameters,
+                ),
                 strategy_request=request,
-                health=CandleHealth(True, False, False, True),
+                health=CandleHealth(
+                    source_available,
+                    matching_gap,
+                    clock_drift,
+                    ledger_consistent,
+                ),
             ),
         )
         progress(100)
@@ -332,6 +380,199 @@ class RuntimeHandlerFactory:
 
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+_INDICATOR_DEFAULTS: dict[str, Decimal] = {
+    "sma_period": Decimal(20),
+    "ema_period": Decimal(20),
+    "rsi_period": Decimal(14),
+    "macd_fast_period": Decimal(12),
+    "macd_slow_period": Decimal(26),
+    "macd_signal_period": Decimal(9),
+    "bollinger_period": Decimal(20),
+    "bollinger_stddev": Decimal(2),
+    "atr_period": Decimal(14),
+    "volume_period": Decimal(20),
+    "rsi_oversold": Decimal(30),
+    "rsi_overbought": Decimal(70),
+}
+_PATTERN_DEFAULTS: dict[str, Decimal] = {
+    "pivot_window": Decimal(2),
+    "similar_level_tolerance": Decimal("0.03"),
+    "minimum_separation": Decimal(2),
+    "breakout_tolerance": Decimal(0),
+    "doji_body_ratio": Decimal("0.1"),
+    "wick_body_ratio": Decimal(2),
+    "volume_confirmation_ratio": Decimal(1),
+}
+
+
+def _indicator_config(parameters: Mapping[str, Decimal]) -> IndicatorConfig:
+    values = {**_INDICATOR_DEFAULTS, **parameters}
+    return IndicatorConfig(
+        sma_period=int(values["sma_period"]),
+        ema_period=int(values["ema_period"]),
+        rsi_period=int(values["rsi_period"]),
+        macd_fast_period=int(values["macd_fast_period"]),
+        macd_slow_period=int(values["macd_slow_period"]),
+        macd_signal_period=int(values["macd_signal_period"]),
+        bollinger_period=int(values["bollinger_period"]),
+        bollinger_stddev=values["bollinger_stddev"],
+        atr_period=int(values["atr_period"]),
+        volume_period=int(values["volume_period"]),
+        rsi_oversold=values["rsi_oversold"],
+        rsi_overbought=values["rsi_overbought"],
+    )
+
+
+def _pattern_config(parameters: Mapping[str, Decimal]) -> PatternConfig:
+    values = {**_PATTERN_DEFAULTS, **parameters}
+    return PatternConfig(
+        pivot_window=int(values["pivot_window"]),
+        similar_level_tolerance=values["similar_level_tolerance"],
+        minimum_separation=int(values["minimum_separation"]),
+        breakout_tolerance=values["breakout_tolerance"],
+        doji_body_ratio=values["doji_body_ratio"],
+        wick_body_ratio=values["wick_body_ratio"],
+        volume_confirmation_ratio=values["volume_confirmation_ratio"],
+    )
+
+
+def _rows_by_timeframe(
+    rows: Sequence[CandleRecord],
+) -> dict[str, tuple[Candle, ...]]:
+    return {
+        timeframe: tuple(
+            _domain_candle(row) for row in rows if row.timeframe == timeframe and row.is_closed
+        )
+        for timeframe in ("15m", "1h", "4h", "1d")
+    }
+
+
+def _strategy_request(
+    *,
+    strategy: StrategyConfig,
+    candles_by_timeframe: Mapping[str, tuple[Candle, ...]],
+    rows: Sequence[CandleRecord],
+    decision_time: datetime,
+    has_position: bool,
+    gaps: Sequence[DataGap],
+) -> StrategyRequest:
+    # StrategyConfig is kept structural here to avoid coupling feature code to Pydantic.
+    indicator_parameters = strategy.indicator_parameters
+    pattern_parameters = strategy.pattern_parameters
+    indicator_config = _indicator_config(indicator_parameters)
+    pattern_engine = PatternEngine(_pattern_config(pattern_parameters))
+    ids = {
+        (row.timeframe, _aware(row.close_time)): row.id
+        for row in rows
+        if row.is_closed and _aware(row.close_time) <= decision_time
+    }
+    contributions: list[SignalContribution] = []
+    blockers: list[str] = []
+    indicator_groups = {
+        "sma": "trend",
+        "ema": "trend",
+        "rsi": "momentum",
+        "macd": "momentum",
+        "bollinger": "volatility",
+        "atr": "volatility",
+        "volume": "volume",
+    }
+    for timeframe in ("15m", "1h", "4h", "1d"):
+        visible = tuple(
+            candle
+            for candle in candles_by_timeframe[timeframe]
+            if candle.close_time <= decision_time
+        )
+        if not visible:
+            blockers.append(f"missing closed {timeframe} candle")
+            continue
+        latest_id = ids.get((timeframe, visible[-1].close_time))
+        if latest_id is None:
+            blockers.append(f"missing lineage for {timeframe} candle")
+            continue
+        indicators = calculate_indicators(visible, indicator_config)
+        if not indicators.tradeable:
+            blockers.append(f"{timeframe} indicator warm-up incomplete")
+        else:
+            for name, evidence in indicators.contributions.items():
+                contributions.append(
+                    SignalContribution(
+                        f"indicator:{name}",
+                        indicators.version,
+                        (latest_id,),
+                        indicator_groups[name],
+                        timeframe,
+                        evidence.score,
+                        Decimal(1),
+                        evidence.reason,
+                    )
+                )
+        for detection in pattern_engine.detect(visible, decision_time):
+            if detection.available_at != visible[-1].close_time:
+                continue
+            score = {
+                "bullish": Decimal(1),
+                "bearish": Decimal(-1),
+                "neutral": Decimal(0),
+            }[detection.direction]
+            contributions.append(
+                SignalContribution(
+                    f"pattern:{detection.name}",
+                    detection.version,
+                    (latest_id,),
+                    "pattern",
+                    timeframe,
+                    score,
+                    detection.confidence,
+                    "; ".join(detection.evidence),
+                )
+            )
+    for gap in gaps:
+        if _aware(gap.start_time) < decision_time and _aware(gap.end_time) <= decision_time:
+            blockers.append(f"data gap {gap.timeframe} {_aware(gap.start_time).isoformat()}")
+    group_weights = {
+        "trend": indicator_parameters.get("trend_weight", Decimal(1)),
+        "momentum": indicator_parameters.get("momentum_weight", Decimal(1)),
+        "volatility": indicator_parameters.get("volatility_weight", Decimal(1)),
+        "volume": indicator_parameters.get("volume_weight", Decimal(1)),
+        "pattern": pattern_parameters.get("pattern_weight", Decimal(1)),
+    }
+    return StrategyRequest(
+        decision_time=decision_time,
+        strategy_version=strategy.version,
+        contributions=tuple(contributions),
+        group_weights=group_weights,
+        timeframe_weights=cast(Mapping[str, Decimal], strategy.timeframe_weights),
+        entry_threshold=strategy.entry_threshold,
+        exit_threshold=strategy.exit_threshold,
+        minimum_confidence=strategy.minimum_confidence,
+        minimum_confirming_groups=strategy.minimum_confirming_groups,
+        has_position=has_position,
+        data_blockers=tuple(sorted(set(blockers))),
+    )
+
+
+def _latest_atr(candles: tuple[Candle, ...], parameters: Mapping[str, Decimal]) -> Decimal | None:
+    if not candles:
+        return None
+    return calculate_indicators(candles, _indicator_config(parameters)).atr
+
+
+def _data_fingerprint(rows: Sequence[CandleRecord]) -> str:
+    payload = [
+        (
+            row.source,
+            row.dataset_id,
+            row.symbol,
+            row.timeframe,
+            _aware(row.open_time).isoformat(),
+            row.source_fingerprint,
+        )
+        for row in sorted(rows, key=lambda item: (item.timeframe, _aware(item.open_time)))
+    ]
+    return sha256(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
 
 
 def _candle_values(candle: Candle, dataset_id: str) -> dict[str, object]:

@@ -9,6 +9,8 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Literal, Protocol
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import Engine, create_engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
@@ -151,10 +153,13 @@ class ApplicationRegistry:
             schema_complete = set(Base.metadata.tables).issubset(tables)
             if self.engine.dialect.name == "postgresql" and "alembic_version" in tables:
                 with self.engine.connect() as connection:
-                    revision = connection.execute(
-                        text("SELECT version_num FROM alembic_version")
-                    ).scalar_one_or_none()
-                schema_complete = schema_complete and revision == "0001_foundation"
+                    revisions = set(
+                        connection.execute(
+                            text("SELECT version_num FROM alembic_version")
+                        ).scalars()
+                    )
+                expected = set(ScriptDirectory.from_config(Config("alembic.ini")).get_heads())
+                schema_complete = schema_complete and revisions == expected
             elif self.engine.dialect.name == "postgresql":
                 schema_complete = False
             migrations = schema_complete and self.migrations_ready_override

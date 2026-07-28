@@ -3,6 +3,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.pool import StaticPool
 
 from tradingagent.backtest import BacktestConfig, BacktestEngine
 from tradingagent.config import CostConfig, RiskConfig
@@ -14,6 +16,13 @@ from tradingagent.paper import (
     PaperEngine,
     PaperSessionState,
     SessionStatus,
+)
+from tradingagent.paper.repository import SQLAlchemyPaperRepository
+from tradingagent.persistence.models import (
+    Base,
+    FillRecord,
+    OrderRecord,
+    SignalDecisionRecord,
 )
 from tradingagent.trading.execution import ExecutionModel
 from tradingagent.trading.pipeline import TradingPipeline
@@ -126,6 +135,7 @@ def cycle(**health_overrides: object) -> PaperCycle:
         candle_id="15m-1",
         candle_close_time=NOW,
         observed_at=NOW + timedelta(minutes=1),
+        candle_open=Decimal("100"),
         reference_price=Decimal("100"),
         candle_low=Decimal("99"),
         candle_high=Decimal("101"),
@@ -165,7 +175,37 @@ def test_session_lifecycle_requires_explicit_transitions_and_stop_is_terminal() 
         service.start("paper-1", now=NOW)
 
 
-def test_repeated_candle_after_restart_does_not_duplicate_order_fill_or_ledger() -> None:
+def test_decision_is_persisted_as_intent_and_fills_at_next_candle_open() -> None:
+    repository = InMemoryPaperRepository()
+    running_session(repository)
+
+    first = engine(repository).process("paper-1", cycle())
+    assert repository.orders("paper-1") == ()
+    assert repository.fills("paper-1") == ()
+    assert first.pending_intent is not None
+
+    next_cycle = replace(
+        cycle(),
+        candle_id="15m-2",
+        candle_close_time=NOW + timedelta(minutes=15),
+        observed_at=NOW + timedelta(minutes=16),
+        candle_open=Decimal("101"),
+        reference_price=Decimal("101"),
+        candle_low=Decimal("100"),
+        candle_high=Decimal("102"),
+        strategy_request=replace(strategy_request(), decision_time=NOW + timedelta(minutes=15)),
+    )
+    restarted = engine(repository).process("paper-1", next_cycle)
+
+    assert restarted.pending_intent is None
+    assert len(repository.decisions("paper-1")) == 2
+    assert len(repository.orders("paper-1")) == 1
+    assert len(repository.fills("paper-1")) == 1
+    assert repository.fills("paper-1")[0].reference_price == Decimal("101")
+    assert len(repository.get("paper-1").ledger.entries) == 3
+
+
+def test_repeated_candle_after_restart_does_not_duplicate_decision() -> None:
     repository = InMemoryPaperRepository()
     running_session(repository)
 
@@ -174,9 +214,77 @@ def test_repeated_candle_after_restart_does_not_duplicate_order_fill_or_ledger()
 
     assert restarted == first
     assert len(repository.decisions("paper-1")) == 1
-    assert len(repository.orders("paper-1")) == 1
-    assert len(repository.fills("paper-1")) == 1
-    assert len(repository.get("paper-1").ledger.entries) == 3
+
+
+@pytest.mark.parametrize("failure_stage", ["after_decision", "after_order", "after_fill"])
+def test_sql_candle_commit_rolls_back_and_restart_creates_no_duplicates(
+    failure_stage: str,
+) -> None:
+    database = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(database)
+    initial = SQLAlchemyPaperRepository(database)
+    initial.create_session(
+        session_id="paper-1",
+        portfolio=Portfolio(Decimal("10000"), Decimal("0")),
+        risk_state=SessionRiskState.initial(Decimal("10000")),
+        configuration_versions=("strategy-v1", "cost-v1", "risk-v1"),
+    )
+    paper_engine = PaperEngine(
+        repository=initial,
+        strategy=StrategyEngine(),
+        risk=RiskEngine(risks()),
+        execution=ExecutionModel(costs()),
+        maximum_candle_age=timedelta(minutes=20),
+    )
+    paper_engine.start("paper-1", now=NOW)
+    paper_engine.process("paper-1", cycle())
+    second = replace(
+        cycle(),
+        candle_id="15m-2",
+        candle_close_time=NOW + timedelta(minutes=15),
+        observed_at=NOW + timedelta(minutes=16),
+        candle_open=Decimal("101"),
+        reference_price=Decimal("101"),
+        candle_low=Decimal("100"),
+        candle_high=Decimal("102"),
+        strategy_request=replace(strategy_request(), decision_time=NOW + timedelta(minutes=15)),
+    )
+
+    def fail(stage: str) -> None:
+        if stage == failure_stage:
+            raise RuntimeError(f"injected {stage}")
+
+    failing = SQLAlchemyPaperRepository(database, failure_injector=fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        PaperEngine(
+            repository=failing,
+            strategy=StrategyEngine(),
+            risk=RiskEngine(risks()),
+            execution=ExecutionModel(costs()),
+            maximum_candle_age=timedelta(minutes=20),
+        ).process("paper-1", second)
+
+    with failing.sessions() as db:
+        assert db.scalar(select(func.count()).select_from(SignalDecisionRecord)) == 1
+        assert db.scalar(select(func.count()).select_from(OrderRecord)) == 0
+        assert db.scalar(select(func.count()).select_from(FillRecord)) == 0
+    recovered = SQLAlchemyPaperRepository(database)
+    result = PaperEngine(
+        repository=recovered,
+        strategy=StrategyEngine(),
+        risk=RiskEngine(risks()),
+        execution=ExecutionModel(costs()),
+        maximum_candle_age=timedelta(minutes=20),
+    ).process("paper-1", second)
+    assert result.pending_intent is None
+    with recovered.sessions() as db:
+        assert db.scalar(select(func.count()).select_from(SignalDecisionRecord)) == 2
+        assert db.scalar(select(func.count()).select_from(OrderRecord)) == 1
+        assert db.scalar(select(func.count()).select_from(FillRecord)) == 1
 
 
 @pytest.mark.parametrize(
@@ -236,19 +344,27 @@ def test_drawdown_kill_switch_is_latched_until_explicit_risk_resume() -> None:
 def test_paper_persists_protection_and_uses_stop_conservatively() -> None:
     repository = InMemoryPaperRepository()
     running_session(repository)
-    entered = engine(repository).process("paper-1", cycle())
+    engine(repository).process("paper-1", cycle())
+    entry_cycle = replace(
+        cycle(),
+        candle_id="15m-2",
+        candle_close_time=NOW + timedelta(minutes=15),
+        observed_at=NOW + timedelta(minutes=16),
+        strategy_request=replace(strategy_request(), decision_time=NOW + timedelta(minutes=15)),
+    )
+    entered = engine(repository).process("paper-1", entry_cycle)
     assert entered.stop_price == Decimal("98")
     assert entered.take_profit_price == Decimal("104")
 
     next_request = replace(
         strategy_request(has_position=True),
-        decision_time=NOW + timedelta(minutes=15),
+        decision_time=NOW + timedelta(minutes=30),
     )
     protective = replace(
         cycle(),
-        candle_id="15m-2",
-        candle_close_time=NOW + timedelta(minutes=15),
-        observed_at=NOW + timedelta(minutes=16),
+        candle_id="15m-3",
+        candle_close_time=NOW + timedelta(minutes=30),
+        observed_at=NOW + timedelta(minutes=31),
         reference_price=Decimal("102"),
         candle_low=Decimal("97"),
         candle_high=Decimal("105"),
@@ -294,6 +410,16 @@ def test_backtest_and_paper_share_strategy_risk_execution_pipeline() -> None:
     running_session(repository)
     paper = engine(repository)
     paper.process("paper-1", cycle())
+    paper.process(
+        "paper-1",
+        replace(
+            cycle(),
+            candle_id="15m-2",
+            candle_close_time=NOW + timedelta(minutes=15),
+            observed_at=NOW + timedelta(minutes=16),
+            strategy_request=replace(strategy_request(), decision_time=NOW + timedelta(minutes=15)),
+        ),
+    )
     paper_fill = repository.fills("paper-1")[0]
 
     bars = tuple(

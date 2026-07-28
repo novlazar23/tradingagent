@@ -1,5 +1,7 @@
 """Alembic environment for the tradingagent schema."""
 
+import os
+
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
@@ -7,6 +9,8 @@ from tradingagent.persistence.models import Base
 
 config = context.config
 target_metadata = Base.metadata
+if database_url := os.getenv("DATABASE_URL"):
+    config.set_main_option("sqlalchemy.url", database_url)
 
 
 def run_migrations_offline() -> None:

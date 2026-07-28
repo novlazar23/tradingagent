@@ -7,7 +7,7 @@ from urllib.error import HTTPError
 
 import pytest
 
-from tradingagent.market_data.adapter import OctoBotHistoryClient, Response
+from tradingagent.market_data.adapter import OctoBotHistoryClient, Response, UrllibGetTransport
 
 
 class ScriptedTransport:
@@ -85,3 +85,69 @@ def test_client_rejects_empty_secret(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="empty"):
         OctoBotHistoryClient("http://history:5002", secret)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://history:5002/prefix",
+        "http://history:5002?target=elsewhere",
+        "http://user:password@history:5002",
+        "ftp://history:5002",
+    ],
+)
+def test_client_requires_an_exact_http_origin(tmp_path: Path, base_url: str) -> None:
+    secret = tmp_path / "key"
+    secret.write_text("dummy-key")
+
+    with pytest.raises(ValueError, match="origin"):
+        OctoBotHistoryClient(base_url, secret)
+
+
+def test_client_rejects_response_larger_than_configured_byte_limit(tmp_path: Path) -> None:
+    secret = tmp_path / "key"
+    secret.write_text("dummy-key")
+    transport = ScriptedTransport([Response(status=200, body=b'{"datasets":["too-large"]}')])
+    client = OctoBotHistoryClient(
+        "http://history:5002",
+        secret,
+        transport=transport,
+        max_response_bytes=8,
+    )
+
+    with pytest.raises(RuntimeError, match="response size limit"):
+        client.list_datasets()
+
+
+def test_client_rejects_candle_page_exceeding_requested_limit(tmp_path: Path) -> None:
+    secret = tmp_path / "key"
+    secret.write_text("dummy-key")
+    rows = [
+        [0, "100", "110", "90", "105", "5"],
+        [900, "105", "112", "101", "108", "6"],
+    ]
+    client = OctoBotHistoryClient(
+        "http://history:5002",
+        secret,
+        transport=ScriptedTransport([response({"candles": rows})]),
+    )
+
+    with pytest.raises(RuntimeError, match="requested row limit"):
+        list(
+            client.iter_candles(
+                dataset_id="dataset.data",
+                symbol="BTC/USDT",
+                timeframe="15m",
+                start=datetime(1970, 1, 1, tzinfo=UTC),
+                end=datetime(1970, 1, 1, 0, 30, tzinfo=UTC),
+                limit=1,
+                now=datetime(1970, 1, 2, tzinfo=UTC),
+            )
+        )
+
+
+def test_default_transport_disables_redirects_and_bounds_reads() -> None:
+    transport = UrllibGetTransport(max_response_bytes=123)
+
+    assert transport.max_response_bytes == 123
+    assert transport.redirects_allowed is False

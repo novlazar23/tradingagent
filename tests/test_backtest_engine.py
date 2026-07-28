@@ -137,3 +137,20 @@ def test_rejects_data_gaps_instead_of_silently_distorting_metrics() -> None:
         assert "gaps" in str(exc)
     else:
         raise AssertionError("gapped candle series accepted")
+
+
+def test_strategy_history_is_a_constant_time_read_only_view() -> None:
+    candles = tuple(candle(index, o="100", h="101", low="99", close="100") for index in range(100))
+    histories: list[object] = []
+
+    def strategy(history: object, _has_position: bool) -> None:
+        histories.append(history)
+        assert len(history) == len(histories)  # type: ignore[arg-type]
+        assert history[-1] is candles[len(histories) - 1]  # type: ignore[index]
+
+    BacktestEngine(
+        execution_model=ExecutionModel(costs()),
+        config=BacktestConfig(initial_capital=Decimal("1000")),
+    ).run(candles, strategy)  # type: ignore[arg-type]
+
+    assert len({id(history) for history in histories}) == 1

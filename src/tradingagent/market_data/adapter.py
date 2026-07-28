@@ -10,8 +10,8 @@ from email.message import Message
 from pathlib import Path
 from typing import Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from tradingagent.domain.models import Candle
 
@@ -36,15 +36,39 @@ class GetTransport(Protocol):
 
 
 class UrllibGetTransport:
-    """Standard-library GET transport; it cannot issue mutating requests."""
+    """GET-only transport with redirects disabled and bounded response reads."""
+
+    redirects_allowed = False
+
+    class _RejectRedirects(HTTPRedirectHandler):
+        def redirect_request(
+            self,
+            req: Request,
+            fp: object,
+            code: int,
+            msg: str,
+            headers: Message,
+            newurl: str,
+        ) -> None:
+            del req, fp, code, msg, headers, newurl
+            return None
+
+    def __init__(self, *, max_response_bytes: int = 8 * 1024 * 1024) -> None:
+        if max_response_bytes <= 0:
+            raise ValueError("max_response_bytes must be positive")
+        self.max_response_bytes = max_response_bytes
+        self._opener = build_opener(self._RejectRedirects())
 
     def get(
         self, url: str, *, params: dict[str, str], headers: dict[str, str], timeout: float
     ) -> Response:
         target = f"{url}?{urlencode(params)}" if params else url
         request = Request(target, headers=headers, method="GET")
-        with urlopen(request, timeout=timeout) as result:  # noqa: S310 - deployment URL
-            return Response(status=result.status, body=result.read())
+        with self._opener.open(request, timeout=timeout) as result:  # noqa: S310
+            body = result.read(self.max_response_bytes + 1)
+            if len(body) > self.max_response_bytes:
+                raise RuntimeError("history response size limit exceeded")
+            return Response(status=result.status, body=body)
 
 
 class OctoBotHistoryClient:
@@ -64,16 +88,35 @@ class OctoBotHistoryClient:
         transport: GetTransport | None = None,
         timeout: float = 10,
         max_retries: int = 3,
+        max_response_bytes: int = 8 * 1024 * 1024,
         retry_delay: Callable[[float], None] = time.sleep,
     ) -> None:
-        if not base_url.startswith(("http://", "https://")):
-            raise ValueError("history base URL must use http or https")
+        parsed = urlsplit(base_url)
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in ("", "/")
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("history base URL must be an exact http(s) origin")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("history base URL must be an exact http(s) origin") from exc
+        if port is None:
+            port = 443 if parsed.scheme == "https" else 80
         key = Path(api_key_file).read_text().strip()
         if not key:
             raise ValueError("history API key file is empty")
-        self._base_url = base_url.rstrip("/")
+        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+        self._base_url = f"{parsed.scheme}://{host}:{port}"
+        self._origin = (parsed.scheme, parsed.hostname, port)
         self._headers = {"X-API-Key": key}
-        self._transport = transport or UrllibGetTransport()
+        self._max_response_bytes = max_response_bytes
+        self._transport = transport or UrllibGetTransport(max_response_bytes=max_response_bytes)
         self._timeout = timeout
         self._max_retries = max_retries
         self._retry_delay = retry_delay
@@ -85,6 +128,16 @@ class OctoBotHistoryClient:
                 response = self._transport.get(
                     url, params=params, headers=self._headers, timeout=self._timeout
                 )
+                response_url = urlsplit(url)
+                response_port = response_url.port or (443 if response_url.scheme == "https" else 80)
+                if (
+                    response_url.scheme,
+                    response_url.hostname,
+                    response_port,
+                ) != self._origin:
+                    raise RuntimeError("history request escaped configured origin")
+                if len(response.body) > self._max_response_bytes:
+                    raise RuntimeError("history response size limit exceeded")
                 if response.status == 429 or response.status >= 500:
                     raise HTTPError(
                         url, response.status, "transient history error", Message(), None
@@ -135,6 +188,8 @@ class OctoBotHistoryClient:
                 },
             )
             rows = collection(payload, "candles")
+            if len(rows) > limit:
+                raise RuntimeError("history response exceeded requested row limit")
             page = sorted(
                 (
                     normalize_candle(

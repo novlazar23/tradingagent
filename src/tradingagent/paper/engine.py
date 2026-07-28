@@ -18,6 +18,7 @@ from tradingagent.paper.models import (
 from tradingagent.paper.repository import PaperRepository
 from tradingagent.trading.execution import ExecutionModel, OrderSide, SimulatedFill
 from tradingagent.trading.ledger import AtomicLedger, LedgerInvariantError, LedgerSnapshot
+from tradingagent.trading.pipeline import TradingPipeline
 from tradingagent.trading.risk import RiskEngine
 from tradingagent.trading.strategy import DecisionAction, StrategyEngine
 
@@ -40,6 +41,7 @@ class PaperEngine:
         self.strategy = strategy
         self.risk = risk
         self.execution = execution
+        self.pipeline = TradingPipeline(strategy, risk, execution)
         self.maximum_candle_age = maximum_candle_age
 
     def start(self, session_id: str, *, now: datetime) -> PaperSessionState:
@@ -98,33 +100,48 @@ class PaperEngine:
         unhealthy = self._health_failure(session, cycle)
         if unhealthy is not None:
             return unhealthy
-        if session.risk_state.paused:
+        observed_risk = self.risk.observe_equity(
+            session.risk_state,
+            session.ledger.portfolio.equity(cycle.reference_price),
+            cycle.observed_at,
+        )
+        session = replace(session, risk_state=observed_risk)
+        self.repository.save(session)
+        if observed_risk.paused:
             return self._transition(
                 session,
                 SessionStatus.PAUSED,
                 "kill_switch_block",
                 "risk-engine",
-                session.risk_state.pause_reason or "risk kill switch",
+                observed_risk.pause_reason or "risk kill switch",
                 cycle.observed_at,
             )
 
+        protective_reason, protective_price = self._protective_trigger(session, cycle)
         request = replace(
             cycle.strategy_request,
             has_position=session.ledger.portfolio.btc > 0,
+            forced_exit_reasons=(
+                (*cycle.strategy_request.forced_exit_reasons, protective_reason)
+                if protective_reason is not None
+                else cycle.strategy_request.forced_exit_reasons
+            ),
         )
-        decision = self.strategy.decide(request)
+        plan = self.pipeline.plan(
+            request=request,
+            portfolio=session.ledger.portfolio,
+            risk_state=session.risk_state,
+            reference_price=cycle.reference_price,
+            atr=cycle.atr,
+            now=cycle.observed_at,
+        )
+        decision = plan.decision
         order: PaperOrder | None = None
         fill: SimulatedFill | None = None
         updated = session
         if decision.action is DecisionAction.ENTER_LONG:
-            approval = self.risk.approve_entry(
-                portfolio=session.ledger.portfolio,
-                state=session.risk_state,
-                entry_price=cycle.reference_price,
-                estimated_fee_rate=self.execution.config.taker_fee_rate,
-                now=cycle.observed_at,
-                atr=cycle.atr,
-            )
+            assert plan.approval is not None
+            approval = plan.approval
             if approval.approved:
                 order, fill, updated = self._execute(
                     session,
@@ -137,12 +154,12 @@ class PaperEngine:
                 updated = replace(
                     updated,
                     risk_state=self.risk.record_entry(updated.risk_state, cycle.observed_at),
+                    stop_price=approval.stop_price,
+                    take_profit_price=approval.take_profit_price,
                 )
         elif decision.action is DecisionAction.EXIT_LONG and session.ledger.portfolio.btc > 0:
-            approval = self.risk.approve_exit(
-                portfolio=session.ledger.portfolio,
-                requested_quantity=session.ledger.portfolio.btc,
-            )
+            assert plan.approval is not None
+            approval = plan.approval
             if approval.approved:
                 order, fill, updated = self._execute(
                     session,
@@ -151,10 +168,13 @@ class PaperEngine:
                     approval.risk_check_id,
                     OrderSide.SELL,
                     approval.quantity,
+                    reference_price=protective_price,
                 )
                 updated = replace(
                     updated,
                     risk_state=self.risk.record_exit(updated.risk_state, cycle.observed_at),
+                    stop_price=None,
+                    take_profit_price=None,
                 )
         checkpoint = PaperCheckpoint(
             cycle.candle_id,
@@ -174,6 +194,7 @@ class PaperEngine:
         risk_check_id: str,
         side: OrderSide,
         quantity: Decimal,
+        reference_price: Decimal | None = None,
     ) -> tuple[PaperOrder, SimulatedFill, PaperSessionState]:
         order_id = sha256(
             f"{session.session_id}:{cycle.candle_id}:{decision_id}:{side}".encode()
@@ -181,7 +202,7 @@ class PaperEngine:
         fill_id = sha256(f"{order_id}:fill".encode()).hexdigest()
         fill = self.execution.fill(
             side=side,
-            reference_price=cycle.reference_price,
+            reference_price=reference_price or cycle.reference_price,
             requested_quantity=quantity,
             atr=cycle.atr,
             fill_id=fill_id,
@@ -209,6 +230,19 @@ class PaperEngine:
             fill.fill_id,
         )
         return order, fill, replace(session, ledger=combined)
+
+    @staticmethod
+    def _protective_trigger(
+        session: PaperSessionState, cycle: PaperCycle
+    ) -> tuple[str | None, Decimal | None]:
+        """Resolve ambiguous OHLC protection conservatively: stop before target."""
+        if session.ledger.portfolio.btc <= 0:
+            return None, None
+        if session.stop_price is not None and cycle.candle_low <= session.stop_price:
+            return "stop_loss", min(cycle.reference_price, session.stop_price)
+        if session.take_profit_price is not None and cycle.candle_high >= session.take_profit_price:
+            return "take_profit", session.take_profit_price
+        return None, None
 
     def _health_failure(
         self, session: PaperSessionState, cycle: PaperCycle

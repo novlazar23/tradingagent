@@ -60,6 +60,19 @@ def test_indicators_match_small_independent_golden_values() -> None:
     assert result.available_at == candles[-1].close_time
     assert result.raw_values["macd_histogram"] == result.macd_histogram
     assert Decimal("-1") <= result.contribution <= Decimal("1")
+    assert set(result.contributions) == {
+        "sma",
+        "ema",
+        "rsi",
+        "macd",
+        "bollinger",
+        "atr",
+        "volume",
+    }
+    for name, evidence in result.contributions.items():
+        assert Decimal("-1") <= evidence.score <= Decimal("1"), name
+        assert evidence.reason
+        assert evidence.raw_values
 
 
 def test_indicators_are_not_tradeable_before_full_warmup() -> None:

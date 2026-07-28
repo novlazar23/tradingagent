@@ -3,11 +3,15 @@
 from decimal import Decimal, localcontext
 
 from tradingagent.domain import Candle
-from tradingagent.features.models import IndicatorConfig, IndicatorResult
+from tradingagent.features.models import IndicatorConfig, IndicatorContribution, IndicatorResult
 
 
 def _mean(values: list[Decimal]) -> Decimal:
     return sum(values, Decimal(0)) / Decimal(len(values))
+
+
+def _clamp(value: Decimal) -> Decimal:
+    return max(Decimal("-1"), min(Decimal("1"), value))
 
 
 def _ema_series(values: list[Decimal], period: int) -> list[Decimal]:
@@ -100,21 +104,45 @@ def calculate_indicators(
     if volume_average is not None and volume_average != 0:
         relative_volume = volumes[-1] / volume_average
     tradeable = len(ordered) >= config.warmup
-    contributions: list[Decimal] = []
-    if sma is not None:
-        contributions.append(Decimal(1) if closes[-1] > sma else Decimal(-1))
-    if rsi is not None:
-        contributions.append(
-            Decimal(1)
-            if rsi <= config.rsi_oversold
-            else Decimal(-1)
-            if rsi >= config.rsi_overbought
-            else Decimal(0)
-        )
-    contributions.append(
-        Decimal(1) if histogram > 0 else Decimal(-1) if histogram < 0 else Decimal(0)
-    )
-    contribution = _mean(contributions) if contributions and tradeable else Decimal(0)
+    price = closes[-1]
+    evidence = {
+        "sma": IndicatorContribution(
+            _clamp((price - sma) / sma) if sma else Decimal(0),
+            "close relative to simple moving average",
+            {"close": price, "sma": sma},
+        ),
+        "ema": IndicatorContribution(
+            _clamp((price - ema) / ema) if ema else Decimal(0),
+            "close relative to exponential moving average",
+            {"close": price, "ema": ema},
+        ),
+        "rsi": IndicatorContribution(
+            _clamp((Decimal(50) - rsi) / Decimal(50)) if rsi is not None else Decimal(0),
+            "mean-reversion score around RSI 50",
+            {"rsi": rsi},
+        ),
+        "macd": IndicatorContribution(
+            _clamp(histogram / max(abs(macd_line), abs(macd_signal), Decimal("1e-18"))),
+            "MACD histogram relative to MACD magnitude",
+            {"line": macd_line, "signal": macd_signal, "histogram": histogram},
+        ),
+        "bollinger": IndicatorContribution(
+            _clamp(Decimal(1) - Decimal(2) * position) if position is not None else Decimal(0),
+            "mean-reversion score from normalized Bollinger position",
+            {"position": position, "bandwidth": bandwidth},
+        ),
+        "atr": IndicatorContribution(
+            Decimal(0),
+            "ATR is risk evidence and has no directional bias",
+            {"atr": atr, "atr_fraction": atr / price if atr is not None else None},
+        ),
+        "volume": IndicatorContribution(
+            _clamp(relative_volume - Decimal(1)) if relative_volume is not None else Decimal(0),
+            "relative volume above or below its configured average",
+            {"relative_volume": relative_volume, "volume_average": volume_average},
+        ),
+    }
+    contribution = _mean([item.score for item in evidence.values()]) if tradeable else Decimal(0)
     raw: dict[str, Decimal | None] = {
         "sma": sma,
         "ema": ema,
@@ -158,4 +186,5 @@ def calculate_indicators(
         volume_average=volume_average,
         relative_volume=relative_volume,
         raw_values=raw,
+        contributions=evidence,
     )

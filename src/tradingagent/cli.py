@@ -2,9 +2,11 @@
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +15,13 @@ import yaml
 
 from tradingagent.api.services import ApplicationRegistry
 from tradingagent.config import AppConfig
+from tradingagent.persistence.runtime import DurableJobWorker, JobScheduler
 
-REGISTRY = ApplicationRegistry()
+REGISTRY = (
+    ApplicationRegistry.from_database_url(os.environ["DATABASE_URL"])
+    if "DATABASE_URL" in os.environ
+    else ApplicationRegistry()
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -77,9 +84,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve-api":
         uvicorn.run("tradingagent.api.app:app", host="0.0.0.0", port=8000)
         return 0
-    if args.command in {"run-worker", "run-scheduler"}:
-        print(json.dumps({"role": args.command, "status": "ready"}))
+    if args.command == "run-worker":
+        worker = DurableJobWorker(REGISTRY, {})
         while True:
+            if not worker.run_once():
+                time.sleep(1)
+    if args.command == "run-scheduler":
+        scheduler = JobScheduler(REGISTRY, interval=timedelta(minutes=15))
+        while True:
+            scheduler.enqueue_due()
+            scheduler.enqueue_data_syncs()
             time.sleep(30)
     if args.command == "config":
         payload = yaml.safe_load(args.path.read_text())
@@ -92,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == "sync":
             _print(REGISTRY.create_job("data_sync"))
         else:
-            _print({"dataset_id": args.dataset_id, "gaps": []})
+            _print({"dataset_id": args.dataset_id, "gaps": REGISTRY.gaps(args.dataset_id)})
         return 0
     if args.command == "backtest":
         if args.action == "run":
@@ -106,8 +120,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         else:
-            resource = REGISTRY.resource(args.id, "backtest")
-            _print({"backtest_id": resource.id, "status": resource.state, "metrics": {}})
+            _print(REGISTRY.backtest_report(args.id))
         return 0
     if args.command == "paper":
         if args.action == "create":
@@ -131,3 +144,7 @@ def main(argv: list[str] | None = None) -> int:
             check=False,
         ).returncode
     return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

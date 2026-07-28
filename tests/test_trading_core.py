@@ -231,6 +231,42 @@ def test_risk_engine_sizes_to_smallest_limit_and_blocks_invalid_long_flat_action
     )
 
 
+def test_risk_entry_quantity_is_affordable_under_worst_execution_quote() -> None:
+    execution = ExecutionModel(
+        costs(
+            spread_bps=Decimal("100"),
+            slippage_bps=Decimal("200"),
+            quantity_quantum=Decimal("0.1"),
+        )
+    )
+    engine = RiskEngine(
+        risks(
+            maximum_position_fraction=Decimal("1"),
+            risk_per_trade_fraction=Decimal("1"),
+            minimum_cash_reserve_fraction=Decimal("0"),
+        )
+    )
+    portfolio = Portfolio(cash=Decimal("1000"), btc=Decimal("0"))
+
+    approval = engine.approve_entry(
+        portfolio=portfolio,
+        state=SessionRiskState.initial(Decimal("1000")),
+        entry_price=Decimal("100"),
+        estimated_fee_rate=Decimal("0"),
+        execution_model=execution,
+        now=NOW,
+    )
+    fill = execution.fill(
+        side=OrderSide.BUY,
+        reference_price=Decimal("100"),
+        requested_quantity=approval.quantity,
+        atr=None,
+    )
+
+    assert approval.approved
+    assert fill.notional + fill.fee <= portfolio.cash
+
+
 def test_drawdown_kill_switch_stays_paused_until_explicit_resume() -> None:
     engine = RiskEngine(risks(maximum_session_drawdown_fraction=Decimal("0.10")))
     state = SessionRiskState.initial(Decimal("10000"))

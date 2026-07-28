@@ -61,6 +61,8 @@ class PaperCycle:
     candle_close_time: datetime
     observed_at: datetime
     reference_price: Decimal
+    candle_low: Decimal
+    candle_high: Decimal
     atr: Decimal | None
     strategy_request: StrategyRequest
     health: CandleHealth
@@ -71,6 +73,12 @@ class PaperCycle:
                 raise ValueError("paper cycle timestamps must be timezone-aware UTC")
         if not self.candle_id or self.reference_price <= 0:
             raise ValueError("candle_id and positive reference_price are required")
+        if self.candle_close_time > self.observed_at:
+            raise ValueError("candle close must be observed before processing")
+        if self.strategy_request.decision_time != self.candle_close_time:
+            raise ValueError("strategy decision time must equal candle close time")
+        if not self.candle_low <= self.reference_price <= self.candle_high:
+            raise ValueError("reference close must lie within candle low/high")
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +114,8 @@ class PaperSessionState:
     checkpoint: PaperCheckpoint | None
     last_error: str | None
     audit_events: tuple[SessionAuditEvent, ...]
+    stop_price: Decimal | None = None
+    take_profit_price: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)

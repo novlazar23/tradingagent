@@ -1,6 +1,7 @@
 """FastAPI composition root with safe observability and versioned routes."""
 
 import logging
+import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -29,6 +30,7 @@ from tradingagent.api.models import (
     StrategyValidationRequest,
 )
 from tradingagent.api.services import ApplicationError, ApplicationRegistry
+from tradingagent.config import AppConfig
 
 LOGGER = logging.getLogger("tradingagent.api")
 ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
@@ -175,14 +177,17 @@ def create_app(registry: ApplicationRegistry | None = None) -> FastAPI:
     ) -> object:
         key = require_idempotency(idempotency_key)
         result = services.idempotent(
-            key, "data_sync", payload.model_dump(), lambda: services.create_job("data_sync")
+            key,
+            "data_sync",
+            payload.model_dump(),
+            lambda: services.create_job("data_sync", payload.model_dump(), idempotency_key=key),
         )
         jobs.labels("data_sync").inc()
         return result
 
     @app.get("/api/v1/data/gaps")
     def gaps(dataset_id: str) -> dict[str, object]:
-        return {"dataset_id": dataset_id, "gaps": []}
+        return {"dataset_id": dataset_id, "gaps": services.gaps(dataset_id)}
 
     @app.post("/api/v1/strategies/validate", responses=ERROR_RESPONSES)
     def validate_strategy(
@@ -190,11 +195,24 @@ def create_app(registry: ApplicationRegistry | None = None) -> FastAPI:
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> object:
         key = require_idempotency(idempotency_key)
+
+        def validate() -> dict[str, object]:
+            try:
+                configuration = AppConfig.model_validate(payload.configuration)
+            except ValueError as exc:
+                raise ApplicationError(
+                    "invalid_configuration", "Strategy configuration is invalid", 422
+                ) from exc
+            return {
+                "valid": True,
+                "configuration": configuration.model_dump(mode="json"),
+            }
+
         return services.idempotent(
             key,
             "strategy_validate",
             payload.model_dump(),
-            lambda: {"valid": True, "configuration": payload.configuration},
+            validate,
         )
 
     def create_resource(kind: str, payload: OperationRequest, key: str | None) -> object:
@@ -228,8 +246,7 @@ def create_app(registry: ApplicationRegistry | None = None) -> FastAPI:
 
     @app.get("/api/v1/backtests/{resource_id}/report", responses=ERROR_RESPONSES)
     def backtest_report(resource_id: str) -> dict[str, object]:
-        resource = services.resource(resource_id, "backtest")
-        return {"backtest_id": resource.id, "status": resource.state, "metrics": {}}
+        return services.backtest_report(resource_id)
 
     @app.post(
         "/api/v1/paper-sessions",
@@ -280,13 +297,11 @@ def create_app(registry: ApplicationRegistry | None = None) -> FastAPI:
 
     @app.get("/api/v1/paper-sessions/{resource_id}/decisions", responses=ERROR_RESPONSES)
     def decisions(resource_id: str) -> dict[str, object]:
-        services.resource(resource_id, "paper_session")
-        return {"session_id": resource_id, "decisions": []}
+        return {"session_id": resource_id, "decisions": services.decisions(resource_id)}
 
     @app.get("/api/v1/paper-sessions/{resource_id}/ledger", responses=ERROR_RESPONSES)
     def ledger(resource_id: str) -> dict[str, object]:
-        services.resource(resource_id, "paper_session")
-        return {"session_id": resource_id, "entries": []}
+        return {"session_id": resource_id, "entries": services.ledger(resource_id)}
 
     @app.get("/api/v1/jobs/{resource_id}", response_model=JobView, responses=ERROR_RESPONSES)
     def job(resource_id: str) -> JobView:
@@ -295,4 +310,13 @@ def create_app(registry: ApplicationRegistry | None = None) -> FastAPI:
     return app
 
 
-app = create_app()
+def _runtime_registry() -> ApplicationRegistry:
+    database_url = os.getenv("DATABASE_URL")
+    return (
+        ApplicationRegistry.from_database_url(database_url)
+        if database_url
+        else ApplicationRegistry()
+    )
+
+
+app = create_app(_runtime_registry())

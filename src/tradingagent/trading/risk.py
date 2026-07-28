@@ -7,6 +7,7 @@ from hashlib import sha256
 
 from tradingagent.config import RiskConfig
 from tradingagent.domain.models import Portfolio
+from tradingagent.trading.execution import ExecutionModel
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +64,7 @@ class RiskEngine:
         state: SessionRiskState,
         entry_price: Decimal,
         estimated_fee_rate: Decimal,
+        execution_model: ExecutionModel | None = None,
         now: datetime,
         atr: Decimal | None = None,
     ) -> RiskApproval:
@@ -92,11 +94,18 @@ class RiskEngine:
         risk_quantity = equity * self.config.risk_per_trade_fraction / stop_distance
         exposure_quantity = equity * self.config.maximum_position_fraction / entry_price
         reserve = equity * self.config.minimum_cash_reserve_fraction
+        unit_cash_cost = (
+            execution_model.worst_buy_unit_cost(reference_price=entry_price, atr=atr)
+            if execution_model is not None
+            else entry_price * (Decimal(1) + estimated_fee_rate)
+        )
         cash_quantity = max(
             Decimal(0),
-            (portfolio.cash - reserve) / (entry_price * (Decimal(1) + estimated_fee_rate)),
+            (portfolio.cash - reserve) / unit_cash_cost,
         )
         quantity = min(risk_quantity, exposure_quantity, cash_quantity)
+        if execution_model is not None:
+            quantity = execution_model.round_quantity(quantity)
         if quantity <= 0:
             return self._approval(False, Decimal(0), None, None, ["insufficient cash"])
         stop = entry_price - stop_distance

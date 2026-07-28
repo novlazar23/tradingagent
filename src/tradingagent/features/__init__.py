@@ -3,6 +3,7 @@
 from tradingagent.features.indicators import calculate_indicators
 from tradingagent.features.models import (
     IndicatorConfig,
+    IndicatorContribution,
     IndicatorResult,
     PatternConfig,
     PatternDetection,
@@ -12,6 +13,7 @@ from tradingagent.features.timeframes import align_closed_candles, organize_time
 
 __all__ = [
     "IndicatorConfig",
+    "IndicatorContribution",
     "IndicatorResult",
     "PatternConfig",
     "PatternDetection",

@@ -1,18 +1,21 @@
 """Chronological, next-bar backtest engine sharing production execution logic."""
 
 import json
-from collections.abc import Callable, Iterable
-from dataclasses import asdict, dataclass
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from hashlib import sha256
+from typing import overload
 
 from tradingagent.domain.models import Candle, Portfolio
 from tradingagent.trading.execution import ExecutionModel, OrderSide, SimulatedFill
 from tradingagent.trading.ledger import AtomicLedger
-from tradingagent.trading.strategy import DecisionAction
+from tradingagent.trading.pipeline import TradingPipeline
+from tradingagent.trading.risk import SessionRiskState
+from tradingagent.trading.strategy import DecisionAction, StrategyRequest
 
-StrategyCallback = Callable[[tuple[Candle, ...], bool], "BacktestOrderIntent | None"]
+StrategyCallback = Callable[[Sequence[Candle], bool], "BacktestOrderIntent | None"]
 ZERO = Decimal(0)
 ONE = Decimal(1)
 
@@ -159,12 +162,55 @@ class _OpenTrade:
     entry_cost: Decimal
 
 
+class _HistoryView(Sequence[Candle]):
+    """Reusable read-only prefix view over immutable execution bars."""
+
+    __slots__ = ("_bars", "_length")
+
+    def __init__(self, bars: tuple[Candle, ...]) -> None:
+        self._bars = bars
+        self._length = 0
+
+    def advance(self) -> None:
+        self._length += 1
+
+    def __len__(self) -> int:
+        return self._length
+
+    @overload
+    def __getitem__(self, index: int) -> Candle: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[Candle]: ...
+
+    def __getitem__(self, index: int | slice) -> Candle | Sequence[Candle]:
+        if isinstance(index, slice):
+            return self._bars[: self._length][index]
+        normalized = index if index >= 0 else self._length + index
+        if normalized < 0 or normalized >= self._length:
+            raise IndexError("history index out of range")
+        return self._bars[normalized]
+
+    def __iter__(self) -> Iterator[Candle]:
+        for index in range(self._length):
+            yield self._bars[index]
+
+
 class BacktestEngine:
     """Consume closed candles in order and execute decisions on the next candle."""
 
-    def __init__(self, *, execution_model: ExecutionModel, config: BacktestConfig) -> None:
+    def __init__(
+        self,
+        *,
+        execution_model: ExecutionModel,
+        config: BacktestConfig,
+        pipeline: TradingPipeline | None = None,
+    ) -> None:
         self.execution_model = execution_model
         self.config = config
+        self.pipeline = pipeline
+        if pipeline is not None and pipeline.execution is not execution_model:
+            raise ValueError("backtest pipeline must share the configured execution model")
 
     def run(self, candles: Iterable[Candle], strategy: StrategyCallback) -> BacktestResult:
         """Run one deterministic simulation.
@@ -182,8 +228,11 @@ class BacktestEngine:
         curve: list[EquityPoint] = []
         peak = self.config.initial_capital
         exposed_bars = 0
+        history = _HistoryView(bars)
+        risk_state = SessionRiskState.initial(self.config.initial_capital)
 
         for index, bar in enumerate(bars):
+            history.advance()
             if pending is not None:
                 open_trade = self._execute_intent(
                     pending, bar, ledger, open_trade, trades, reason="signal"
@@ -217,7 +266,40 @@ class BacktestEngine:
                     (peak - equity) / peak,
                 )
             )
-            decision_intent = strategy(bars[: index + 1], portfolio.btc > 0)
+            candidate = strategy(history, portfolio.btc > 0)
+            if isinstance(candidate, StrategyRequest):
+                if self.pipeline is None:
+                    raise ValueError("StrategyRequest callback requires a shared pipeline")
+                request = candidate
+                if request.has_position != (portfolio.btc > 0):
+                    request = replace(request, has_position=portfolio.btc > 0)
+                plan = self.pipeline.plan(
+                    request=request,
+                    portfolio=portfolio,
+                    risk_state=risk_state,
+                    reference_price=bar.close,
+                    atr=None,
+                    now=bar.close_time,
+                )
+                approval = plan.approval
+                decision_intent = (
+                    BacktestOrderIntent(
+                        plan.decision.decision_id,
+                        plan.decision.action,
+                        approval.quantity,
+                        approval.stop_price,
+                        approval.take_profit_price,
+                    )
+                    if approval is not None and approval.approved
+                    else None
+                )
+                if decision_intent is not None:
+                    if decision_intent.action is DecisionAction.ENTER_LONG:
+                        risk_state = self.pipeline.risk.record_entry(risk_state, bar.close_time)
+                    else:
+                        risk_state = self.pipeline.risk.record_exit(risk_state, bar.close_time)
+            else:
+                decision_intent = candidate
             if decision_intent is not None:
                 pending = decision_intent
 
@@ -304,8 +386,9 @@ class BacktestEngine:
         return None, None
 
     def _snapshot(self, bars: tuple[Candle, ...]) -> BacktestRunSnapshot:
-        candle_payload = [
-            {
+        data_hasher = sha256()
+        for b in bars:
+            candle_payload = {
                 "source": b.source,
                 "dataset_id": b.dataset_id,
                 "symbol": b.symbol,
@@ -319,10 +402,11 @@ class BacktestEngine:
                 "volume": str(b.volume),
                 "source_fingerprint": b.source_fingerprint,
             }
-            for b in bars
-        ]
-        data_json = json.dumps(candle_payload, sort_keys=True, separators=(",", ":"))
-        data_fingerprint = sha256(data_json.encode()).hexdigest()
+            data_hasher.update(
+                json.dumps(candle_payload, sort_keys=True, separators=(",", ":")).encode()
+            )
+            data_hasher.update(b"\n")
+        data_fingerprint = data_hasher.hexdigest()
         configuration_json = json.dumps(
             {
                 "backtest": asdict(self.config),

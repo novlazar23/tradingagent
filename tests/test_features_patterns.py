@@ -73,3 +73,22 @@ def test_double_bottom_is_hidden_until_breakout_confirmation_closes() -> None:
     assert pattern.available_at == candles[-1].close_time
     assert pattern.start_time == candles[1].open_time
     assert pattern.invalidation_level == candles[1].low
+
+
+def test_chart_pattern_requires_configured_volume_confirmation() -> None:
+    candles = [
+        candle(0, "12", "13", "11", "12"),
+        candle(1, "11", "11.2", "9", "10"),
+        candle(2, "10", "12", "9.8", "11.5"),
+        candle(3, "11", "11.2", "9.1", "10"),
+        candle(4, "10.5", "12.5", "10.4", "12.2", "10"),
+    ]
+    config = PatternConfig(
+        pivot_window=1,
+        minimum_separation=2,
+        volume_confirmation_ratio=Decimal("2"),
+    )
+
+    result = PatternEngine(config).detect(candles, candles[-1].close_time)
+
+    assert not any(item.name == "double_bottom" for item in result)

@@ -1,6 +1,6 @@
 """Confirmed-pivot chart patterns and closed-candle formations."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 
@@ -273,7 +273,17 @@ class PatternEngine:
         found.extend(self._head_shoulders(candles, highs, lows))
         found.extend(self._triangles(candles, highs, lows))
         found.extend(self._zones(candles, highs, lows))
-        return found
+        previous = candles[:-1]
+        average_volume = (
+            sum((item.volume for item in previous), Decimal(0)) / Decimal(len(previous))
+            if previous
+            else candles[-1].volume
+        )
+        required = average_volume * self.config.volume_confirmation_ratio
+        if candles[-1].volume < required:
+            return []
+        detail = f"breakout volume {candles[-1].volume} confirms required volume {required}"
+        return [replace(item, evidence=(*item.evidence, detail)) for item in found]
 
     def _head_shoulders(
         self, candles: list[Candle], highs: list[_Pivot], lows: list[_Pivot]

@@ -13,12 +13,19 @@ Service und ein lokales Secret. Die Anwendungs-API wird ausschließlich an
 ```bash
 export POSTGRES_PASSWORD='ein-langes-lokales-passwort'
 export OCTOBOT_HISTORY_API_KEY_FILE=/opt/docker/stacks/octobot/secrets/history_api_key
-export OCTOBOT_HISTORY_BASE_URL=http://192.168.178.20:5002
 docker compose up --build -d
 docker compose ps
 curl http://127.0.0.1:8000/health/live
 curl http://127.0.0.1:8000/health/ready
 ```
+
+API, Worker und Scheduler besitzen kein direktes Egress-Netz. Historienabrufe
+laufen ausschließlich über einen Read-only-Proxy, der nur die zwei benötigten
+GET-Routen an den festen Upstream `192.168.178.20:5002` weiterleitet. Diese
+Grenze verhindert beliebige ausgehende Verbindungen der Anwendung, setzt aber
+weiterhin voraus, dass der konfigurierte OctoBot-Dienst und das lokale LAN
+vertrauenswürdig sind. Für eine nicht vertrauenswürdige Netzstrecke muss der
+History-Dienst zusätzlich TLS mit verifizierter Serveridentität anbieten.
 
 Der History-Schlüssel wird nur als read-only Docker Secret unter
 `/run/secrets/octobot_history_api_key` eingebunden. Er darf nie in `.env`,

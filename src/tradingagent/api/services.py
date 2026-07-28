@@ -1,13 +1,30 @@
-"""In-memory application ports preserving API contracts until repositories are wired."""
+"""Repository-backed application services shared by API, CLI and background roles."""
 
 import hashlib
 import json
 import threading
 import uuid
-from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Literal
 
+from sqlalchemy import Engine, create_engine, inspect, select, text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
 from tradingagent.api.models import AcceptedOperation, JobView, ResourceView
+from tradingagent.persistence.models import (
+    BacktestMetric,
+    BacktestRun,
+    Base,
+    CashLedgerRecord,
+    DataGap,
+    IdempotencyRecord,
+    JobRecord,
+    MarketDataset,
+    PaperSession,
+    SignalDecisionRecord,
+)
 
 
 class ApplicationError(Exception):
@@ -20,57 +37,104 @@ class ApplicationError(Exception):
         self.status_code = status_code
 
 
-@dataclass(frozen=True)
-class Replay:
-    fingerprint: str
-    result: object
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 class ApplicationRegistry:
-    """Thread-safe reference adapter for jobs and run state.
+    """Transactional repository and application-service facade.
 
-    It intentionally performs no trading and exposes no exchange-order capability.
+    An injected engine is the supported production/test composition. The default
+    isolated SQLite database preserves a safe local CLI and unit-test experience;
+    Compose injects PostgreSQL through :meth:`from_database_url`.
     """
 
     def __init__(
         self,
         *,
+        engine: Engine | None = None,
         database_ready: bool = True,
         migrations_ready: bool = True,
         configuration_ready: bool = True,
         history_ready: bool = True,
     ) -> None:
-        self.database_ready = database_ready
-        self.migrations_ready = migrations_ready
+        self.engine = engine or create_engine(
+            "sqlite+pysqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        if engine is None:
+            Base.metadata.create_all(self.engine)
+        self.sessions = sessionmaker(self.engine, expire_on_commit=False)
+        self.database_ready_override = database_ready
+        self.migrations_ready_override = migrations_ready
         self.configuration_ready = configuration_ready
         self.history_ready = history_ready
-        self.datasets: list[dict[str, object]] = []
-        self.jobs: dict[str, JobView] = {}
-        self.resources: dict[str, ResourceView] = {}
-        self.replays: dict[str, Replay] = {}
-        self._lock = threading.RLock()
+        self._idempotency_lock = threading.RLock()
+
+    @classmethod
+    def from_database_url(
+        cls, database_url: str, *, configuration_ready: bool = True, history_ready: bool = True
+    ) -> "ApplicationRegistry":
+        """Create a shared registry without silently creating production tables."""
+        return cls(
+            engine=create_engine(database_url, pool_pre_ping=True),
+            configuration_ready=configuration_ready,
+            history_ready=history_ready,
+        )
+
+    @property
+    def datasets(self) -> list[dict[str, object]]:
+        with self.sessions() as session:
+            records = session.scalars(
+                select(MarketDataset).order_by(MarketDataset.external_id)
+            ).all()
+            return [
+                {
+                    "id": record.id,
+                    "source": record.source,
+                    "external_id": record.external_id,
+                    "symbol": record.symbol,
+                    "selected": record.selected,
+                    **record.metadata_json,
+                }
+                for record in records
+            ]
 
     def readiness(
         self,
     ) -> tuple[Literal["ok", "degraded", "not_ready"], dict[str, str]]:
+        database = False
+        migrations = False
+        try:
+            tables = set(inspect(self.engine).get_table_names())
+            database = bool(tables) and self.database_ready_override
+            schema_complete = set(Base.metadata.tables).issubset(tables)
+            if self.engine.dialect.name == "postgresql" and "alembic_version" in tables:
+                with self.engine.connect() as connection:
+                    revision = connection.execute(
+                        text("SELECT version_num FROM alembic_version")
+                    ).scalar_one_or_none()
+                schema_complete = schema_complete and revision == "0001_foundation"
+            elif self.engine.dialect.name == "postgresql":
+                schema_complete = False
+            migrations = schema_complete and self.migrations_ready_override
+        except SQLAlchemyError:
+            pass
         dependencies = {
-            "database": "available" if self.database_ready else "unavailable",
-            "migrations": "current" if self.migrations_ready else "pending",
+            "database": "available" if database else "unavailable",
+            "migrations": "current" if migrations else "pending",
             "configuration": "valid" if self.configuration_ready else "invalid",
             "history": "available" if self.history_ready else "unavailable",
         }
-        required = self.database_ready and self.migrations_ready and self.configuration_ready
-        return (
-            ("degraded" if required and not self.history_ready else "ok", dependencies)
-            if required
-            else (
-                "not_ready",
-                dependencies,
-            )
-        )
+        required = database and migrations and self.configuration_ready
+        status: Literal["ok", "degraded", "not_ready"]
+        status = "not_ready" if not required else ("degraded" if not self.history_ready else "ok")
+        return status, dependencies
 
-    def idempotent(self, key: str, operation: str, payload: object, factory: object) -> object:
-        fingerprint = hashlib.sha256(
+    @staticmethod
+    def _fingerprint(operation: str, payload: object) -> str:
+        return hashlib.sha256(
             json.dumps(
                 {"operation": operation, "payload": payload},
                 sort_keys=True,
@@ -78,42 +142,102 @@ class ApplicationRegistry:
                 default=str,
             ).encode()
         ).hexdigest()
-        replay_key = f"{operation}:{key}"
-        with self._lock:
-            previous = self.replays.get(replay_key)
-            if previous:
-                if previous.fingerprint != fingerprint:
-                    raise ApplicationError(
-                        "idempotency_conflict",
-                        "The idempotency key was already used with a different request",
-                        409,
+
+    @staticmethod
+    def _restore(result_type: str, result: dict[str, object]) -> object:
+        if result_type == "AcceptedOperation":
+            return AcceptedOperation.model_validate(result)
+        if result_type == "JobView":
+            return JobView.model_validate(result)
+        if result_type == "ResourceView":
+            return ResourceView.model_validate(result)
+        return result
+
+    def idempotent(self, key: str, operation: str, payload: object, factory: object) -> object:
+        fingerprint = self._fingerprint(operation, payload)
+        if not callable(factory):
+            raise TypeError("factory must be callable")
+        with self._idempotency_lock:
+            with self.sessions() as session:
+                previous = session.scalar(
+                    select(IdempotencyRecord).where(
+                        IdempotencyRecord.operation == operation,
+                        IdempotencyRecord.idempotency_key == key,
                     )
-                return previous.result
-            if not callable(factory):
-                raise TypeError("factory must be callable")
+                )
+                if previous is not None:
+                    if previous.fingerprint != fingerprint:
+                        raise ApplicationError(
+                            "idempotency_conflict",
+                            "The idempotency key was already used with a different request",
+                            409,
+                        )
+                    return self._restore(previous.result_type, previous.result)
             result = factory()
-            self.replays[replay_key] = Replay(fingerprint, result)
+            result_type = type(result).__name__
+            serialized = (
+                result.model_dump(mode="json") if hasattr(result, "model_dump") else dict(result)
+            )
+            with self.sessions.begin() as session:
+                session.add(
+                    IdempotencyRecord(
+                        id=str(uuid.uuid4()),
+                        operation=operation,
+                        idempotency_key=key,
+                        fingerprint=fingerprint,
+                        result_type=result_type,
+                        result=serialized,
+                        created_at=_utcnow(),
+                    )
+                )
+                try:
+                    session.flush()
+                except IntegrityError as exc:
+                    raise ApplicationError(
+                        "idempotency_conflict", "Concurrent request conflict", 409
+                    ) from exc
             return result
 
     def create(self, kind: str, payload: dict[str, object]) -> AcceptedOperation:
-        resource_id = str(uuid.uuid4())
-        job_id = str(uuid.uuid4())
-        resource_kind: Literal["backtest", "paper_session"] = (
-            "backtest" if kind == "backtest" else "paper_session"
-        )
-        self.resources[resource_id] = ResourceView(
-            id=resource_id,
-            kind=resource_kind,
-            state="queued" if kind == "backtest" else "created",
-            request=payload,
-        )
-        self.jobs[job_id] = JobView(
-            id=job_id,
-            kind=f"{kind}_create",
-            status="queued",
-            progress=0,
-            retry_count=0,
-        )
+        resource_id, job_id = str(uuid.uuid4()), str(uuid.uuid4())
+        now = _utcnow()
+        with self.sessions.begin() as session:
+            if kind == "backtest":
+                session.add(
+                    BacktestRun(
+                        id=resource_id,
+                        state="queued",
+                        request=payload,
+                        result=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            else:
+                session.add(
+                    PaperSession(
+                        id=resource_id,
+                        state="created",
+                        request=payload,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            session.add(
+                JobRecord(
+                    id=job_id,
+                    kind=f"{kind}_create",
+                    status="queued",
+                    progress=0,
+                    retry_count=0,
+                    maximum_retries=3,
+                    payload={"resource_id": resource_id, **payload},
+                    idempotency_key=f"resource:{resource_id}",
+                    available_at=now,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
         base = "/api/v1/backtests" if kind == "backtest" else "/api/v1/paper-sessions"
         return AcceptedOperation(
             resource_id=resource_id,
@@ -122,32 +246,83 @@ class ApplicationRegistry:
             job_url=f"/api/v1/jobs/{job_id}",
         )
 
-    def create_job(self, kind: str) -> JobView:
-        job_id = str(uuid.uuid4())
-        job = JobView(
-            id=job_id,
-            kind=kind,
-            status="queued",
-            progress=0,
-            retry_count=0,
+    def create_job(
+        self,
+        kind: str,
+        payload: dict[str, object] | None = None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> JobView:
+        now, job_id = _utcnow(), str(uuid.uuid4())
+        operation_key = idempotency_key or job_id
+        with self.sessions.begin() as session:
+            existing = session.scalar(
+                select(JobRecord).where(
+                    JobRecord.kind == kind,
+                    JobRecord.idempotency_key == operation_key,
+                )
+            )
+            if existing is not None:
+                return self._job_view(existing)
+            record = JobRecord(
+                id=job_id,
+                kind=kind,
+                status="queued",
+                progress=0,
+                retry_count=0,
+                maximum_retries=3,
+                payload=payload or {},
+                idempotency_key=operation_key,
+                available_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(record)
+            session.flush()
+        return self._job_view(record)
+
+    @staticmethod
+    def _job_view(record: JobRecord) -> JobView:
+        return JobView(
+            id=record.id,
+            kind=record.kind,
+            status=record.status,  # type: ignore[arg-type]
+            progress=record.progress,
+            retry_count=record.retry_count,
+            error_class=record.error_class,
+            error_message=record.error_message,
         )
-        self.jobs[job_id] = job
-        return job
 
     def resource(self, resource_id: str, expected_kind: str) -> ResourceView:
-        resource = self.resources.get(resource_id)
-        if resource is None or resource.kind != expected_kind:
-            raise ApplicationError("resource_not_found", "Resource not found", 404)
-        return resource
+        with self.sessions() as session:
+            if expected_kind == "backtest":
+                backtest = session.get(BacktestRun, resource_id)
+                if backtest is None:
+                    raise ApplicationError("resource_not_found", "Resource not found", 404)
+                return ResourceView(
+                    id=backtest.id,
+                    kind="backtest",
+                    state=backtest.state,
+                    request=backtest.request,
+                )
+            paper = session.get(PaperSession, resource_id)
+            if paper is None:
+                raise ApplicationError("resource_not_found", "Resource not found", 404)
+            return ResourceView(
+                id=paper.id,
+                kind="paper_session",
+                state=paper.state,
+                request=paper.request,
+            )
 
     def job(self, job_id: str) -> JobView:
-        try:
-            return self.jobs[job_id]
-        except KeyError as exc:
-            raise ApplicationError("job_not_found", "Job not found", 404) from exc
+        with self.sessions() as session:
+            record = session.get(JobRecord, job_id)
+            if record is None:
+                raise ApplicationError("job_not_found", "Job not found", 404)
+            return self._job_view(record)
 
     def transition(self, resource_id: str, action: str) -> ResourceView:
-        resource = self.resource(resource_id, "paper_session")
         transitions = {
             ("created", "start"): "running",
             ("paused", "resume"): "running",
@@ -156,13 +331,96 @@ class ApplicationRegistry:
             ("running", "stop"): "stopped",
             ("paused", "stop"): "stopped",
         }
-        new_state = transitions.get((resource.state, action))
-        if new_state is None:
-            raise ApplicationError(
-                "invalid_state_transition",
-                f"Cannot {action} a session in state {resource.state}",
-                409,
+        with self.sessions.begin() as session:
+            resource = session.get(PaperSession, resource_id)
+            if resource is None:
+                raise ApplicationError("resource_not_found", "Resource not found", 404)
+            new_state = transitions.get((resource.state, action))
+            if new_state is None:
+                raise ApplicationError(
+                    "invalid_state_transition",
+                    f"Cannot {action} a session in state {resource.state}",
+                    409,
+                )
+            resource.state, resource.updated_at = new_state, _utcnow()
+            session.flush()
+            return ResourceView(
+                id=resource.id,
+                kind="paper_session",
+                state=resource.state,
+                request=resource.request,
             )
-        updated = resource.model_copy(update={"state": new_state})
-        self.resources[resource_id] = updated
-        return updated
+
+    def gaps(self, dataset_id: str) -> list[dict[str, object]]:
+        with self.sessions() as session:
+            rows = session.scalars(
+                select(DataGap).where(DataGap.dataset_id == dataset_id).order_by(DataGap.start_time)
+            ).all()
+            return [
+                {
+                    "id": row.id,
+                    "timeframe": row.timeframe,
+                    "start_time": row.start_time,
+                    "end_time": row.end_time,
+                    "reason": row.reason,
+                    "resolved_at": row.resolved_at,
+                }
+                for row in rows
+            ]
+
+    def backtest_report(self, resource_id: str) -> dict[str, object]:
+        with self.sessions() as session:
+            run = session.get(BacktestRun, resource_id)
+            if run is None:
+                raise ApplicationError("resource_not_found", "Resource not found", 404)
+            metrics = session.scalars(
+                select(BacktestMetric).where(BacktestMetric.run_id == resource_id)
+            ).all()
+            return {
+                "backtest_id": run.id,
+                "status": run.state,
+                "result": run.result,
+                "metrics": {
+                    row.name: str(row.value) if row.value is not None else row.payload
+                    for row in metrics
+                },
+            }
+
+    def decisions(self, session_id: str) -> list[dict[str, object]]:
+        self.resource(session_id, "paper_session")
+        with self.sessions() as session:
+            rows = session.scalars(
+                select(SignalDecisionRecord)
+                .where(SignalDecisionRecord.paper_session_id == session_id)
+                .order_by(SignalDecisionRecord.decided_at)
+            ).all()
+            return [
+                {
+                    "id": row.id,
+                    "action": row.action,
+                    "score": str(row.score),
+                    "explanation": row.explanation,
+                    "decided_at": row.decided_at,
+                }
+                for row in rows
+            ]
+
+    def ledger(self, session_id: str) -> list[dict[str, object]]:
+        self.resource(session_id, "paper_session")
+        with self.sessions() as session:
+            rows = session.scalars(
+                select(CashLedgerRecord)
+                .where(CashLedgerRecord.session_id == session_id)
+                .order_by(CashLedgerRecord.occurred_at)
+            ).all()
+            return [
+                {
+                    "id": row.id,
+                    "entry_type": row.entry_type,
+                    "asset": row.asset,
+                    "amount": str(row.amount),
+                    "reference_id": row.reference_id,
+                    "occurred_at": row.occurred_at,
+                }
+                for row in rows
+            ]

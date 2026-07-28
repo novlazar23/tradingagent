@@ -60,6 +60,21 @@ class IndicatorConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class IndicatorContribution:
+    """One normalized, auditable indicator input to strategy scoring."""
+
+    score: Decimal
+    reason: str
+    raw_values: dict[str, Decimal | None]
+
+    def __post_init__(self) -> None:
+        if not Decimal("-1") <= self.score <= Decimal("1"):
+            raise ValueError("indicator contribution must be normalized to [-1, 1]")
+        if not self.reason or not self.raw_values:
+            raise ValueError("indicator contribution requires reason and raw values")
+
+
+@dataclass(frozen=True, slots=True)
 class IndicatorResult:
     """Latest raw indicator snapshot plus normalized strategy evidence."""
 
@@ -84,6 +99,7 @@ class IndicatorResult:
     volume_average: Decimal | None = None
     relative_volume: Decimal | None = None
     raw_values: dict[str, Decimal | None] = field(default_factory=dict)
+    contributions: dict[str, IndicatorContribution] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

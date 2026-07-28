@@ -80,6 +80,7 @@ def upgrade() -> None:
         sa.Column("claimed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("lease_owner", sa.String(length=128), nullable=True),
         sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("claim_generation", sa.Integer(), server_default=sa.text("0"), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.PrimaryKeyConstraint("id"),
@@ -188,6 +189,12 @@ def upgrade() -> None:
         "ix_candles_lookup",
         "candles",
         ["dataset_id", "symbol", "timeframe", "open_time"],
+        unique=False,
+    )
+    op.create_index(
+        "ix_candles_closed_close",
+        "candles",
+        ["dataset_id", "timeframe", "is_closed", "close_time"],
         unique=False,
     )
     op.create_table(
@@ -390,6 +397,7 @@ def downgrade() -> None:
     op.drop_index("ix_cash_ledger_session_time", table_name="cash_ledger")
     op.drop_index("ix_cash_ledger_page", table_name="cash_ledger")
     op.drop_table("cash_ledger")
+    op.drop_index("ix_candles_closed_close", table_name="candles")
     op.drop_index("ix_candles_lookup", table_name="candles")
     op.drop_table("candles")
     op.drop_table("backtest_metrics")

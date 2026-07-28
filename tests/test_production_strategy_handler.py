@@ -1,12 +1,20 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+
 from tradingagent.backtest import BacktestConfig, BacktestEngine
 from tradingagent.config import CostConfig, RiskConfig, StrategyConfig
 from tradingagent.domain import Candle
-from tradingagent.persistence.handlers import _paper_execution_rows, _strategy_request
-from tradingagent.persistence.models import CandleRecord, DataGap
+from tradingagent.persistence.handlers import (
+    _paper_execution_rows,
+    _persist_candle_batch,
+    _strategy_request,
+)
+from tradingagent.persistence.models import Base, CandleRecord, CandleRevision, DataGap
 from tradingagent.trading import ExecutionModel, RiskEngine, StrategyEngine, TradingPipeline
 
 START = datetime(2026, 1, 1, tzinfo=UTC)
@@ -200,3 +208,23 @@ def test_paper_execution_rows_are_empty_when_checkpoint_is_caught_up() -> None:
     rows = records({"15m": candles("15m", 3)})
 
     assert _paper_execution_rows(rows, rows[-1].close_time) == []
+
+
+def test_candle_batch_insert_and_revision_are_bounded_and_idempotent() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    original = candles("15m", 1)[0]
+    changed = replace(
+        original,
+        close=Decimal("101.5"),
+        source_fingerprint="revised-fingerprint",
+    )
+
+    with Session(engine) as db:
+        assert _persist_candle_batch(db, [original], "dataset", START) == (1, 0)
+        db.commit()
+        assert _persist_candle_batch(db, [original], "dataset", START) == (0, 0)
+        assert _persist_candle_batch(db, [changed], "dataset", START) == (0, 1)
+        db.commit()
+        assert db.scalar(select(CandleRecord.close)) == Decimal("101.5")
+        assert db.scalar(select(CandleRevision.id)) is not None

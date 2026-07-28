@@ -1,3 +1,11 @@
+x-db-environment: &db-environment
+  DATABASE_HOST: postgres
+  DATABASE_PORT: "5432"
+  DATABASE_NAME: tradingagent
+  DATABASE_USER: tradingagent
+  DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
+  TRADINGAGENT_CONFIG: /app/config/config.yaml
+
 x-app: &app
   build: .
   restart: unless-stopped
@@ -8,22 +16,10 @@ x-app: &app
   cap_drop:
     - ALL
   environment:
-    DATABASE_HOST: postgres
-    DATABASE_PORT: "5432"
-    DATABASE_NAME: tradingagent
-    DATABASE_USER: tradingagent
-    DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
-    OCTOBOT_HISTORY_BASE_URL: http://history-proxy:8080
-    OCTOBOT_HISTORY_API_KEY_FILE: /run/secrets/octobot_history_api_key
-    TRADINGAGENT_CONFIG: /app/config/config.yaml
+    <<: *db-environment
   volumes:
     - ${TRADINGAGENT_CONFIG_FILE:-./config.yaml}:/app/config/config.yaml:ro
   secrets:
-    - source: octobot_history_api_key
-      target: octobot_history_api_key
-      uid: "10001"
-      gid: "10001"
-      mode: 0400
     - source: postgres_password
       target: postgres_password
       uid: "10001"
@@ -36,7 +32,6 @@ x-app: &app
     - /tmp:size=64m,mode=1777
   networks:
     - backend
-    - history-client
   logging:
     driver: json-file
     options:
@@ -71,6 +66,24 @@ services:
   worker:
     <<: *app
     command: ["run-worker"]
+    environment:
+      <<: *db-environment
+      OCTOBOT_HISTORY_BASE_URL: http://history-proxy:8080
+      OCTOBOT_HISTORY_API_KEY_FILE: /run/secrets/octobot_history_api_key
+    secrets:
+      - source: postgres_password
+        target: postgres_password
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: octobot_history_api_key
+        target: octobot_history_api_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    networks:
+      - backend
+      - history-client
     depends_on:
       migrate:
         condition: service_completed_successfully

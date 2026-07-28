@@ -66,6 +66,13 @@ class CandleRecord(Base):
             name="uq_candles_identity",
         ),
         Index("ix_candles_lookup", "dataset_id", "symbol", "timeframe", "open_time"),
+        Index(
+            "ix_candles_closed_close",
+            "dataset_id",
+            "timeframe",
+            "is_closed",
+            "close_time",
+        ),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False)

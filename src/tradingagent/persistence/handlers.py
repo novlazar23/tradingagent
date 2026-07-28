@@ -109,73 +109,58 @@ class RuntimeHandlerFactory:
         inserted = revised = 0
         for timeframe_value in ("15m", "1h", "4h", "1d"):
             timeframe = parse_timeframe(timeframe_value)
-            candles = tuple(
-                self.history.iter_candles(
-                    dataset_id=external_id,
-                    symbol="BTC/USDT",
-                    timeframe=timeframe,
-                    start=start,
-                    end=end,
-                    limit=self.config.deployment.history_page_limit,
-                    now=now,
-                )
+            candles = self.history.iter_candles(
+                dataset_id=external_id,
+                symbol="BTC/USDT",
+                timeframe=timeframe,
+                start=start,
+                end=end,
+                limit=self.config.deployment.history_page_limit,
+                now=now,
             )
+            present: set[datetime] = set()
             with self.registry.sessions.begin() as db:
                 _fence(progress, db)
+                batch: list[Candle] = []
                 for candle in candles:
-                    existing = db.scalar(
-                        select(CandleRecord).where(
-                            CandleRecord.source == candle.source,
-                            CandleRecord.dataset_id == dataset_id,
-                            CandleRecord.symbol == candle.symbol,
-                            CandleRecord.timeframe == candle.timeframe,
-                            CandleRecord.open_time == candle.open_time,
+                    present.add(candle.open_time)
+                    batch.append(candle)
+                    if len(batch) == self.config.deployment.history_page_limit:
+                        added, changed = _persist_candle_batch(db, batch, dataset_id, now)
+                        inserted += added
+                        revised += changed
+                        batch.clear()
+                if batch:
+                    added, changed = _persist_candle_batch(db, batch, dataset_id, now)
+                    inserted += added
+                    revised += changed
+                existing_gaps = set(
+                    db.scalars(
+                        select(DataGap.start_time).where(
+                            DataGap.dataset_id == dataset_id,
+                            DataGap.timeframe == timeframe,
+                            DataGap.start_time >= start,
+                            DataGap.start_time < end,
                         )
-                    )
-                    values = _candle_values(candle, dataset_id)
-                    if existing is None:
-                        db.add(CandleRecord(id=str(uuid.uuid4()), **values))
-                        inserted += 1
-                    elif existing.source_fingerprint != candle.source_fingerprint:
-                        before = _record_payload(existing)
-                        for name, value in values.items():
-                            setattr(existing, name, value)
-                        db.add(
-                            CandleRevision(
-                                id=str(uuid.uuid4()),
-                                candle_id=existing.id,
-                                before=before,
-                                after=_json(values),
-                                revised_at=now,
-                            )
-                        )
-                        revised += 1
-                present = {candle.open_time for candle in candles}
+                    ).all()
+                )
                 cursor = start
                 step = timedelta(
                     seconds={"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}[timeframe]
                 )
                 while cursor < end:
-                    if cursor not in present:
-                        existing_gap = db.scalar(
-                            select(DataGap.id).where(
-                                DataGap.dataset_id == dataset_id,
-                                DataGap.timeframe == timeframe,
-                                DataGap.start_time == cursor,
+                    if cursor not in present and cursor not in existing_gaps:
+                        db.add(
+                            DataGap(
+                                id=str(uuid.uuid4()),
+                                dataset_id=dataset_id,
+                                timeframe=timeframe,
+                                start_time=cursor,
+                                end_time=cursor + step,
+                                reason="missing_source_candle",
+                                detected_at=now,
                             )
                         )
-                        if existing_gap is None:
-                            db.add(
-                                DataGap(
-                                    id=str(uuid.uuid4()),
-                                    dataset_id=dataset_id,
-                                    timeframe=timeframe,
-                                    start_time=cursor,
-                                    end_time=cursor + step,
-                                    reason="missing_source_candle",
-                                    detected_at=now,
-                                )
-                            )
                     cursor += step
             progress(int((("15m", "1h", "4h", "1d").index(timeframe) + 1) * 25))
         return {"inserted": inserted, "revised": revised}
@@ -348,14 +333,25 @@ class RuntimeHandlerFactory:
             if snapshot is None or paper is None:
                 raise ValueError("paper lineage is incomplete")
             dataset_id = str(paper.request.get("dataset_id", payload.get("dataset_id", "")))
-            rows = db.scalars(
-                select(CandleRecord)
-                .where(
-                    CandleRecord.dataset_id == dataset_id,
-                    CandleRecord.is_closed.is_(True),
+            rows: list[CandleRecord] = []
+            for timeframe in ("15m", "1h", "4h", "1d"):
+                maximum = (
+                    self.config.deployment.backtest_max_candles
+                    * 15
+                    // _TIMEFRAME_MINUTES[timeframe]
                 )
-                .order_by(CandleRecord.close_time)
-            ).all()
+                rows.extend(
+                    db.scalars(
+                        select(CandleRecord)
+                        .where(
+                            CandleRecord.dataset_id == dataset_id,
+                            CandleRecord.timeframe == timeframe,
+                            CandleRecord.is_closed.is_(True),
+                        )
+                        .order_by(CandleRecord.close_time.desc())
+                        .limit(maximum)
+                    ).all()
+                )
             gaps = db.scalars(select(DataGap).where(DataGap.dataset_id == dataset_id)).all()
         resolved = self.snapshots.resolve(snapshot.payload, code_version=self.code_version)
         engine = self._paper_engine(resolved, repository=repository)
@@ -369,14 +365,15 @@ class RuntimeHandlerFactory:
                 "processed_candles": 0,
             }
         result = state
+        candles_by_timeframe = _rows_by_timeframe(rows)
+        candle_ids = _candle_ids(rows)
         for index, candle in enumerate(execution_rows, start=1):
             decision_time = _aware(candle.close_time)
-            visible_rows = [row for row in rows if _aware(row.close_time) <= decision_time]
-            candles_by_timeframe = _rows_by_timeframe(visible_rows)
             request = _strategy_request(
                 strategy=resolved.configuration.strategy,
                 candles_by_timeframe=candles_by_timeframe,
-                rows=visible_rows,
+                rows=rows,
+                candle_ids=candle_ids,
                 decision_time=decision_time,
                 has_position=result.ledger.portfolio.btc > 0,
                 gaps=gaps,
@@ -505,7 +502,11 @@ def _rows_by_timeframe(
 ) -> dict[str, tuple[Candle, ...]]:
     return {
         timeframe: tuple(
-            _domain_candle(row) for row in rows if row.timeframe == timeframe and row.is_closed
+            _domain_candle(row)
+            for row in sorted(
+                (item for item in rows if item.timeframe == timeframe and item.is_closed),
+                key=lambda item: (_aware(item.close_time), item.id),
+            )
         )
         for timeframe in ("15m", "1h", "4h", "1d")
     }
@@ -654,6 +655,53 @@ def _data_fingerprint(rows: Sequence[CandleRecord]) -> str:
         hasher.update(json.dumps(payload, separators=(",", ":")).encode())
         hasher.update(b"\n")
     return hasher.hexdigest()
+
+
+def _persist_candle_batch(
+    db: Session,
+    candles: Sequence[Candle],
+    dataset_id: str,
+    revised_at: datetime,
+) -> tuple[int, int]:
+    """Persist one bounded page with a single identity lookup."""
+    if not candles:
+        return 0, 0
+    first = candles[0]
+    open_times = [candle.open_time for candle in candles]
+    existing_by_time = {
+        _aware(row.open_time): row
+        for row in db.scalars(
+            select(CandleRecord).where(
+                CandleRecord.source == first.source,
+                CandleRecord.dataset_id == dataset_id,
+                CandleRecord.symbol == first.symbol,
+                CandleRecord.timeframe == first.timeframe,
+                CandleRecord.open_time.in_(open_times),
+            )
+        ).all()
+    }
+    inserted = revised = 0
+    for candle in candles:
+        existing = existing_by_time.get(_aware(candle.open_time))
+        values = _candle_values(candle, dataset_id)
+        if existing is None:
+            db.add(CandleRecord(id=str(uuid.uuid4()), **values))
+            inserted += 1
+        elif existing.source_fingerprint != candle.source_fingerprint:
+            before = _record_payload(existing)
+            for name, value in values.items():
+                setattr(existing, name, value)
+            db.add(
+                CandleRevision(
+                    id=str(uuid.uuid4()),
+                    candle_id=existing.id,
+                    before=before,
+                    after=_json(values),
+                    revised_at=revised_at,
+                )
+            )
+            revised += 1
+    return inserted, revised
 
 
 def _candle_values(candle: Candle, dataset_id: str) -> dict[str, object]:

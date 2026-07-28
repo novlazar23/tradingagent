@@ -49,6 +49,7 @@ def test_compose_isolates_apps_behind_fixed_history_proxy() -> None:
     assert "internal: true" in compose
     assert "OCTOBOT_HISTORY_BASE_URL: http://history-proxy:8080" in compose
     assert "192.168.178.20:5002" in proxy
+    assert "location = /health" in proxy
     assert "location = /api/v1/historical/candles" in proxy
     assert "location /" in proxy and "return 404" in proxy
 
@@ -72,11 +73,17 @@ def test_initial_migration_is_present() -> None:
     assert "op.create_index" in source
     assert "Base" not in source
     assert "tradingagent.persistence.models" not in source
+    assert '"claim_generation"' in source
+    assert '"ix_candles_closed_close"' in source
 
 
 def test_compose_mounts_secrets_with_least_privilege_metadata() -> None:
     compose = (ROOT / "compose.yaml").read_text()
+    api = compose.split("\n  api:\n", 1)[1].split("\n  worker:\n", 1)[0]
+    worker = compose.split("\n  worker:\n", 1)[1].split("\n  scheduler:\n", 1)[0]
     assert "source: octobot_history_api_key" in compose
+    assert "source: octobot_history_api_key" not in api
+    assert "source: octobot_history_api_key" in worker
     assert "source: postgres_password" in compose
     assert 'uid: "10001"' in compose
     assert 'uid: "70"' in compose

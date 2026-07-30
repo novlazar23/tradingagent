@@ -1,0 +1,70 @@
+services:
+  worker:
+    environment:
+      TRANSCRIPTION_BASE_URL: http://whisper:8080
+    volumes:
+      - ./artifacts:/app/artifacts
+
+  whisper:
+    build:
+      context: .
+      dockerfile: infra/whisper.Dockerfile
+    image: tradingagent-whisper:local
+    profiles: [transcription]
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    environment:
+      WHISPER_MODEL_DIR: /models
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-int8}
+    volumes:
+      - whisper-models:/models
+    ports:
+      - "127.0.0.1:${WHISPER_PORT:-8090}:8080"
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    networks:
+      - backend
+
+  freqtrade-backtest:
+    image: freqtradeorg/freqtrade:stable@sha256:87aa5c6d65359b34e9d99a0bb260a38c0efe0315253811e6f48c2afe8f278a6a
+    profiles: [backtesting]
+    read_only: true
+    user: "10001:10001"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    command:
+      - backtesting
+      - --config
+      - /freqtrade/config.json
+      - --strategy
+      - ${FREQTRADE_STRATEGY:-GeneratedStrategy}
+      - --strategy-path
+      - /freqtrade/strategies
+      - --datadir
+      - /freqtrade/data
+      - --data-format-ohlcv
+      - json
+      - --export
+      - signals
+      - --export-directory
+      - /freqtrade/results
+    volumes:
+      - ./infra/freqtrade_config.json:/freqtrade/config.json:ro
+      - ./artifacts/strategies:/freqtrade/strategies:ro
+      - ./artifacts/freqtrade_data:/freqtrade/data:ro
+      - ./artifacts/backtest_results:/freqtrade/results
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+
+networks:
+  backend:
+    internal: true
+
+volumes:
+  whisper-models:

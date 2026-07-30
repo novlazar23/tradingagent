@@ -1,0 +1,203 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        timezone: [UTC, Europe/Berlin]
+    env:
+      TZ: ${{ matrix.timezone }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.22"
+          enable-cache: true
+      - run: uv sync --frozen --extra dev
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy src
+      - run: uv run pytest --cov=tradingagent --cov-report=term-missing --cov-fail-under=85
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.22"
+      - name: Audit the locked production dependency set
+        run: |
+          uv export --frozen --no-dev --no-emit-project --output-file requirements.lock
+          uvx --from pip-audit==2.9.0 pip-audit --requirement requirements.lock
+
+  postgres-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: tradingagent
+          POSTGRES_USER: tradingagent
+          POSTGRES_PASSWORD: integration-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tradingagent -d tradingagent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_PASSWORD_FILE: ${{ github.workspace }}/.ci-postgres-password
+      DATABASE_HOST: 127.0.0.1
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: tradingagent
+      DATABASE_USER: tradingagent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.22"
+      - run: uv sync --frozen --extra dev
+      - name: Migrate empty PostgreSQL database
+        run: |
+          printf '%s' 'integration-only' > "$DATABASE_PASSWORD_FILE"
+          chmod 600 "$DATABASE_PASSWORD_FILE"
+          uv run alembic upgrade head
+          uv run alembic current --check-heads
+      - name: Verify PostgreSQL rollback on injected transaction failure
+        run: |
+          uv run python - <<'PY'
+          from sqlalchemy import create_engine, select
+          from tradingagent.config import database_url_from_environment
+          from tradingagent.persistence.models import ConfigurationSnapshot
+
+          engine = create_engine(database_url_from_environment())
+          try:
+              with engine.begin() as connection:
+                  connection.execute(
+                      ConfigurationSnapshot.__table__.insert(),
+                      {
+                          "id": "ci-rollback-probe",
+                          "version_hash": "ci-rollback-probe",
+                          "payload": {},
+                          "created_at": __import__("datetime").datetime.now(
+                              __import__("datetime").UTC
+                          ),
+                      },
+                  )
+                  raise RuntimeError("injected transaction failure")
+          except RuntimeError:
+              pass
+          with engine.connect() as connection:
+              probe = connection.scalar(
+                  select(ConfigurationSnapshot.id).where(
+                      ConfigurationSnapshot.id == "ci-rollback-probe"
+                  )
+              )
+          assert probe is None, "failed transaction left partial durable state"
+          PY
+          uv run alembic check
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+          uv run alembic current --check-heads
+      - name: Verify schema and readiness
+        run: |
+          uv run python - <<'PY'
+          from tradingagent.api.services import ApplicationRegistry
+          from tradingagent.config import database_url_from_environment
+          url = database_url_from_environment()
+          assert url is not None
+          status, dependencies = ApplicationRegistry.from_database_url(url).readiness()
+          assert status in {"ok", "degraded"}, (status, dependencies)
+          assert dependencies["migrations"] == "current"
+          PY
+      - name: Generate deterministic OpenAPI artifact
+        run: |
+          mkdir -p artifacts
+          uv run python - <<'PY'
+          import json
+          from pathlib import Path
+          from tradingagent.api.app import create_app
+          schema = create_app().openapi()
+          assert schema["openapi"].startswith("3.")
+          assert "/health/ready" in schema["paths"]
+          Path("artifacts/openapi.json").write_text(
+              json.dumps(schema, sort_keys=True, separators=(",", ":")) + "\n"
+          )
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openapi
+          path: artifacts/openapi.json
+
+  compose-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare local-only Compose inputs
+        run: |
+          mkdir -p .ci-secrets
+          printf '%s' 'history-integration-only' > .ci-secrets/history
+          printf '%s' 'postgres-integration-only' > .ci-secrets/postgres
+          cp config.example.yaml .ci-config.yaml
+      - name: Build, start, restart and verify the hardened stack
+        env:
+          OCTOBOT_HISTORY_API_KEY_FILE: ${{ github.workspace }}/.ci-secrets/history
+          POSTGRES_PASSWORD_FILE: ${{ github.workspace }}/.ci-secrets/postgres
+          TRADINGAGENT_CONFIG_FILE: ${{ github.workspace }}/.ci-config.yaml
+        run: |
+          compose='docker compose -f compose.yaml -f compose.ci.yaml'
+          trap '$compose logs --no-color; $compose down --volumes' EXIT
+          docker compose config --quiet
+          $compose config --quiet
+          $compose build api worker scheduler migrate
+          $compose up --detach history-stub history-proxy postgres migrate api worker
+          for attempt in $(seq 1 30); do
+            if $compose exec -T api /app/.venv/bin/python -c \
+              "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"; then
+              break
+            fi
+            test "$attempt" -lt 30
+            sleep 2
+          done
+          $compose exec -T api /app/.venv/bin/python /tmp/ci_compose_workflow.py exercise
+          $compose restart postgres api worker
+          for attempt in $(seq 1 30); do
+            if $compose exec -T api /app/.venv/bin/python -c \
+              "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"; then
+              break
+            fi
+            test "$attempt" -lt 30
+            sleep 2
+          done
+          $compose exec -T api /app/.venv/bin/python /tmp/ci_compose_workflow.py verify
+          $compose up --detach scheduler
+
+  image-security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release-equivalent image
+        run: docker build --tag tradingagent:ci .
+      - name: Scan image with trivy
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: tradingagent:ci
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+      - name: Generate syft SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: tradingagent:ci
+          artifact-name: tradingagent.spdx.json

@@ -1,0 +1,24 @@
+{
+  "candlesticks": {
+    "doji": [["10", "12", "8", "10.01"]],
+    "hammer": [["10", "11.2", "6", "11"]],
+    "hanging_man": [["11", "11.2", "6", "10"]],
+    "inverted_hammer": [["10", "15", "9.8", "11"]],
+    "shooting_star": [["11", "15", "9.8", "10"]],
+    "bullish_engulfing": [["11", "11.2", "8.8", "9"], ["8.5", "11.5", "8", "11.2"]],
+    "bearish_engulfing": [["9", "11.2", "8.8", "11"], ["11.5", "12", "8.5", "8.8"]],
+    "morning_star": [["12", "12.2", "8.8", "9"], ["9", "9.5", "8.5", "9.1"], ["9", "11", "8.8", "11"]],
+    "evening_star": [["9", "12.2", "8.8", "12"], ["12", "12.5", "11.5", "11.9"], ["12", "12.2", "9.5", "10"]]
+  },
+  "chart_patterns": [
+    "double_top",
+    "double_bottom",
+    "head_and_shoulders",
+    "inverse_head_and_shoulders",
+    "symmetrical_triangle",
+    "ascending_triangle",
+    "descending_triangle",
+    "horizontal_support",
+    "horizontal_resistance"
+  ]
+}

@@ -1,0 +1,192 @@
+x-db-environment: &db-environment
+  DATABASE_HOST: postgres
+  DATABASE_PORT: "5432"
+  DATABASE_NAME: tradingagent
+  DATABASE_USER: tradingagent
+  DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
+  TRADINGAGENT_CONFIG: /app/config/config.yaml
+
+x-app: &app
+  build: .
+  restart: unless-stopped
+  read_only: true
+  user: "10001:10001"
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  environment:
+    <<: *db-environment
+  volumes:
+    - ${TRADINGAGENT_CONFIG_FILE:-./config.yaml}:/app/config/config.yaml:ro
+  secrets:
+    - source: postgres_password
+      target: postgres_password
+      uid: "10001"
+      gid: "10001"
+      mode: 0400
+  depends_on:
+    postgres:
+      condition: service_healthy
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  networks:
+    - backend
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+  deploy:
+    resources:
+      limits:
+        memory: 1G
+        cpus: "1.0"
+
+services:
+  frontend:
+    image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    restart: unless-stopped
+    read_only: true
+    user: "101:101"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./infra/frontend.conf:/etc/nginx/nginx.conf:ro
+    tmpfs:
+      - /var/cache/nginx:size=16m,uid=101,gid=101,mode=0700
+      - /var/run:size=1m,uid=101,gid=101,mode=0755
+      - /tmp:size=8m,mode=1777
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-8080}:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - backend
+
+  api:
+    <<: *app
+    command: ["serve-api"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  worker:
+    <<: *app
+    command: ["run-worker"]
+    environment:
+      <<: *db-environment
+      OCTOBOT_HISTORY_BASE_URL: http://history-proxy:8080
+      OCTOBOT_HISTORY_API_KEY_FILE: /run/secrets/octobot_history_api_key
+    secrets:
+      - source: postgres_password
+        target: postgres_password
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: octobot_history_api_key
+        target: octobot_history_api_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    networks:
+      - backend
+      - history-client
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  scheduler:
+    <<: *app
+    command: ["run-scheduler"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["db", "migrate"]
+
+  history-proxy:
+    image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    restart: unless-stopped
+    user: "101:101"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ./infra/history-proxy.conf:/etc/nginx/nginx.conf:ro
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /var/cache/nginx:size=16m,uid=101,gid=101,mode=0700
+    networks:
+      - history-client
+      - history-egress
+
+  postgres:
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    restart: unless-stopped
+    user: "70:70"
+    environment:
+      POSTGRES_DB: tradingagent
+      POSTGRES_USER: tradingagent
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - source: postgres_password
+        target: postgres_password
+        uid: "70"
+        gid: "70"
+        mode: 0400
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tradingagent -d tradingagent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    tmpfs:
+      - /run/postgresql:size=8m,uid=70,gid=70,mode=0770
+      - /tmp:size=16m,mode=1777
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    cap_drop:
+      - ALL
+
+secrets:
+  octobot_history_api_key:
+    file: ${OCTOBOT_HISTORY_API_KEY_FILE:?required}
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_FILE:?required}
+
+volumes:
+  postgres-data:
+
+networks:
+  backend:
+    internal: true
+  history-client:
+    internal: true
+  history-egress:
+    internal: false

@@ -44,6 +44,30 @@ x-app: &app
         cpus: "1.0"
 
 services:
+  frontend:
+    image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    restart: unless-stopped
+    read_only: true
+    user: "101:101"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./infra/frontend.conf:/etc/nginx/nginx.conf:ro
+    tmpfs:
+      - /var/cache/nginx:size=16m,uid=101,gid=101,mode=0700
+      - /var/run:size=1m,uid=101,gid=101,mode=0755
+      - /tmp:size=8m,mode=1777
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-8080}:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - backend
+
   api:
     <<: *app
     command: ["serve-api"]

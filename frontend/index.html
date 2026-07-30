@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Tradingagent Control Plane</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div><span class="eyebrow">BTC / USDT · PAPER ONLY</span><h1>Tradingagent</h1></div>
+    <div id="health" class="pill pending">Prüfe API …</div>
+  </header>
+  <main class="shell">
+    <nav class="tabs" aria-label="Bereiche">
+      <button class="tab active" data-panel="dashboard">Dashboard</button>
+      <button class="tab" data-panel="backtest">Backtest</button>
+      <button class="tab" data-panel="paper">Paper-Trading</button>
+      <button class="tab" data-panel="strategy">Strategie</button>
+      <button class="tab" data-panel="data">Daten</button>
+    </nav>
+    <div id="notice" class="notice" role="status"></div>
+    <section id="dashboard" class="panel active">
+      <div class="hero"><div><span class="eyebrow">CONTROL PLANE</span><h2>Simulation unter Kontrolle</h2><p>Konfiguration ändern, Jobs starten und Ergebnisse prüfen — ohne Live-Orders.</p></div><div class="hero-mark">₿</div></div>
+      <div class="grid three"><article class="card"><span class="label">Markt</span><strong>BTC/USDT</strong><small>Spot · konfigurierbar</small></article><article class="card"><span class="label">Betriebsmodus</span><strong>Paper only</strong><small>Live-Handel ist nicht vorhanden</small></article><article class="card"><span class="label">API</span><strong id="apiState">—</strong><small id="apiDetail">Bereitschaft wird geprüft</small></article></div>
+      <div class="card"><div class="card-head"><h3>Schnellstart</h3><button class="ghost" data-panel="strategy">Strategie öffnen →</button></div><div class="steps"><div><b>01</b><span>OctoBot-Daten synchronisieren</span></div><div><b>02</b><span>Konfiguration validieren</span></div><div><b>03</b><span>Backtest oder Paper-Session starten</span></div></div></div>
+    </section>
+    <section id="backtest" class="panel"><div class="section-head"><div><span class="eyebrow">RESEARCH</span><h2>Backtest starten</h2><p>Der Job läuft asynchron. Fortschritt und Report können unten abgefragt werden.</p></div></div><form id="backtestForm" class="card form"><label>Datensatz-ID<input name="dataset_id" value="ExchangeHistoryDataCollector" required></label><label>Konfigurationsversion<input name="configuration_version" value="strategy-v1" required></label><button class="primary">Backtest einreihen</button></form><div id="backtestResult" class="result"></div></section>
+    <section id="paper" class="panel"><div class="section-head"><div><span class="eyebrow">SIMULATION</span><h2>Paper-Trading</h2><p>Session erstellen und sicher über Zustandsübergänge steuern.</p></div></div><form id="paperForm" class="card form"><label>Datensatz-ID<input name="dataset_id" value="ExchangeHistoryDataCollector" required></label><label>Konfigurationsversion<input name="configuration_version" value="strategy-v1" required></label><button class="primary">Session erstellen</button></form><div id="paperResult" class="result"></div></section>
+    <section id="strategy" class="panel"><div class="section-head"><div><span class="eyebrow">CONFIGURATION</span><h2>Strategie anpassen</h2><p>Nur die fachlichen Abschnitte werden akzeptiert. Secrets und Deployment-Parameter bleiben außerhalb der UI.</p></div></div><form id="strategyForm" class="card form"><label>Konfiguration (JSON)<textarea name="configuration" rows="18" spellcheck="false"></textarea></label><button class="primary">Konfiguration validieren</button></form><div id="strategyResult" class="result"></div><div class="card callout"><b>Video-Strategien</b><p>Whisper-Transkription und Freqtrade-Kompilierung laufen im Worker-Stack. Die erzeugte DSL bleibt zunächst <code>draft</code> und muss vor dem Kompilieren menschlich freigegeben werden.</p><code>docker compose -f compose.yaml -f compose.strategy.yaml --profile transcription up -d whisper</code></div></section>
+    <section id="data" class="panel"><div class="section-head"><div><span class="eyebrow">MARKET DATA</span><h2>Datensätze</h2><p>Lesender Überblick über die registrierten OctoBot-Historien.</p></div><button id="refreshDatasets" class="secondary">Aktualisieren</button></div><div id="datasets" class="card table-wrap">Noch nicht geladen.</div></section>
+  </main>
+  <footer>Tradingagent · intern · keine Anlageberatung · keine Live-Ausführung</footer>
+  <script src="app.js" defer></script>
+</body>
+</html>

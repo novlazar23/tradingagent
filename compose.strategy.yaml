@@ -55,7 +55,7 @@ services:
       - --export-directory
       - /freqtrade/results
     volumes:
-      - ./artifacts/freqtrade_config.json:/freqtrade/config.json:ro
+      - ./infra/freqtrade_config.json:/freqtrade/config.json:ro
       - ./artifacts/strategies:/freqtrade/strategies:ro
       - ./artifacts/freqtrade_data:/freqtrade/data:ro
       - ./artifacts/backtest_results:/freqtrade/results

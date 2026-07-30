@@ -133,6 +133,54 @@ separate Entscheidung und mindestens TLS, Authentifizierung, Autorisierung und
 ein gehärteter Reverse Proxy erforderlich. Vor Releases müssen Dependency- und
 Container-Scans sowie die vollständige Test-Suite erfolgreich sein.
 
+## Video-Strategien mit Whisper und Freqtrade
+
+Video-Strategien werden nicht direkt in ausführbaren Python-Code übersetzt.
+Zuerst entsteht ein Transkript mit dem lokalen Whisper-Dienst, danach ein
+versioniertes Strategie-DSL. Nur freigegebene DSL-Dokumente dürfen in eine
+Freqtrade-Strategie kompiliert werden.
+
+Whisper und Freqtrade werden als optionale Compose-Profile betrieben:
+
+```bash
+docker compose -f compose.yaml -f compose.strategy.yaml --profile transcription up -d whisper
+docker compose -f compose.yaml -f compose.strategy.yaml run --rm worker strategy transcribe \
+  --url 'https://www.youtube.com/watch?v=VIDEO_ID' \
+  --output artifacts/transcripts/video.json
+docker compose -f compose.yaml -f compose.strategy.yaml run --rm worker strategy extract \
+  --transcript artifacts/transcripts/video.json \
+  --name rsi_video \
+  --output artifacts/strategies/rsi_video.strategy.json
+```
+
+Das Whisper-Modell ist standardmäßig `small` und kann über `--model` oder
+`WHISPER_DEVICE`/`WHISPER_COMPUTE_TYPE` angepasst werden. Der Dienst akzeptiert
+ausschließlich HTTPS-URLs von YouTube.
+
+Eine freigegebene DSL-Datei wird kompiliert:
+
+```bash
+docker compose -f compose.yaml -f compose.strategy.yaml run --rm worker strategy compile \
+  --spec artifacts/strategies/rsi_breakout.json \
+  --output artifacts/strategies/RsiBreakoutStrategy.py
+```
+
+Die Extraktion erzeugt absichtlich den Status `draft`. Vor dem Kompilieren muss
+die Datei geprüft und auf `"status": "approved"` gesetzt werden.
+
+OctoBot-Daten werden im Freqtrade-JSON-Format unter
+`artifacts/freqtrade_data/BTC_USDT-<timeframe>.json` abgelegt. Der Backtest läuft
+isoliert und ohne Börsenschlüssel:
+
+```bash
+docker compose -f compose.yaml -f compose.strategy.yaml --profile backtesting run --rm \
+  -e FREQTRADE_STRATEGY=RsiBreakoutStrategy freqtrade-backtest
+```
+
+Vor der Paper-Freigabe müssen Backtest, Out-of-sample-Test, Lookahead-Analysis
+und Recursive-Analysis geprüft werden. Ein erfolgreiches Backtest-Ergebnis ist
+keine Zusage für zukünftige Rendite.
+
 ## Entwicklung
 
 ```bash

@@ -22,6 +22,17 @@ def test_compose_declares_separate_mandatory_services_and_secret() -> None:
     assert "read_only: true" in compose
 
 
+def test_strategy_compose_declares_isolated_whisper_and_freqtrade_profiles() -> None:
+    compose = (ROOT / "compose.strategy.yaml").read_text()
+
+    assert "whisper:" in compose
+    assert "profiles: [transcription]" in compose
+    assert "freqtrade-backtest:" in compose
+    assert "profiles: [backtesting]" in compose
+    assert "freqtradeorg/freqtrade:stable" in compose
+    assert "--export" in compose and "signals" in compose
+
+
 def test_compose_uses_secret_only_database_password_and_migration_gate() -> None:
     compose = (ROOT / "compose.yaml").read_text()
     assert "POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password" in compose

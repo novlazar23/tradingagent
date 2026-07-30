@@ -19,6 +19,10 @@ from tradingagent.market_data.adapter import OctoBotHistoryClient
 from tradingagent.persistence.bootstrap import bootstrap_environment
 from tradingagent.persistence.handlers import RuntimeHandlerFactory
 from tradingagent.persistence.runtime import DurableJobWorker, JobScheduler
+from tradingagent.strategy_lab.compiler import compile_freqtrade_strategy
+from tradingagent.strategy_lab.extractor import extract_strategy
+from tradingagent.strategy_lab.models import StrategySpec, TranscriptSegment
+from tradingagent.strategy_lab.whisper import WhisperClient
 
 _DATABASE_URL = database_url_from_environment()
 REGISTRY = (
@@ -71,6 +75,23 @@ def build_parser() -> argparse.ArgumentParser:
     for action in ("start", "pause", "resume", "stop", "status"):
         operation = paper.add_parser(action)
         operation.add_argument("id")
+
+    strategy = commands.add_parser(
+        "strategy", help="video-derived strategy operations"
+    ).add_subparsers(dest="action", required=True)
+    transcribe = strategy.add_parser("transcribe")
+    transcribe.add_argument("--url", required=True)
+    transcribe.add_argument("--output", type=Path, required=True)
+    transcribe.add_argument("--model", default="small")
+    transcribe.add_argument("--language")
+    extract = strategy.add_parser("extract")
+    extract.add_argument("--transcript", type=Path, required=True)
+    extract.add_argument("--name", required=True)
+    extract.add_argument("--timeframe", default="1h")
+    extract.add_argument("--output", type=Path, required=True)
+    compile_command = strategy.add_parser("compile")
+    compile_command.add_argument("--spec", type=Path, required=True)
+    compile_command.add_argument("--output", type=Path, required=True)
 
     database = commands.add_parser("db", help="database operations").add_subparsers(
         dest="action", required=True
@@ -184,6 +205,44 @@ def main(argv: list[str] | None = None) -> int:
             _print(REGISTRY.resource(args.id, "paper_session"))
         else:
             _print(REGISTRY.transition(args.id, args.action))
+        return 0
+    if args.command == "strategy":
+        if args.action == "transcribe":
+            base_url = __import__("os").environ.get("TRANSCRIPTION_BASE_URL", "http://whisper:8080")
+            transcript = WhisperClient(base_url, model=args.model).transcribe(
+                args.url, language=args.language
+            )
+            args.output.write_text(
+                json.dumps(
+                    {
+                        "source_url": args.url,
+                        "language": transcript.language,
+                        "segments": [segment.model_dump() for segment in transcript.segments],
+                    },
+                    sort_keys=True,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            _print({"output": str(args.output), "segments": len(transcript.segments)})
+        elif args.action == "extract":
+            source = json.loads(args.transcript.read_text(encoding="utf-8"))
+            segments = tuple(
+                TranscriptSegment.model_validate(segment) for segment in source["segments"]
+            )
+            spec = extract_strategy(
+                name=args.name,
+                source_url=str(source["source_url"]),
+                segments=segments,
+                timeframe=args.timeframe,
+            )
+            args.output.write_text(spec.model_dump_json(indent=2) + "\n", encoding="utf-8")
+            _print({"status": spec.status, "strategy": spec.name, "output": str(args.output)})
+        else:
+            spec = StrategySpec.model_validate_json(args.spec.read_text(encoding="utf-8"))
+            args.output.write_text(compile_freqtrade_strategy(spec), encoding="utf-8")
+            _print({"output": str(args.output), "strategy": spec.name})
         return 0
     if args.command == "db":
         return subprocess.run(

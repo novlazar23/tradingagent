@@ -12,7 +12,7 @@ def test_cli_exposes_required_commands(capsys: object) -> None:
     except SystemExit as exc:
         assert exc.code == 0
     output = capsys.readouterr().out  # type: ignore[attr-defined]
-    for command in ("bootstrap", "config", "data", "backtest", "paper", "db"):
+    for command in ("bootstrap", "config", "data", "backtest", "paper", "strategy", "db"):
         assert command in output
 
 
@@ -114,6 +114,31 @@ def test_cli_paper_requires_explicit_subcommand() -> None:
         assert exc.code != 0
     else:
         raise AssertionError("paper without a subcommand must fail")
+
+
+def test_strategy_commands_have_stable_parse_contract() -> None:
+    transcribe = build_parser().parse_args(
+        ["strategy", "transcribe", "--url", "https://youtu.be/example", "--output", "t.json"]
+    )
+    compile_ = build_parser().parse_args(
+        ["strategy", "compile", "--spec", "spec.json", "--output", "Strategy.py"]
+    )
+    extract = build_parser().parse_args(
+        [
+            "strategy",
+            "extract",
+            "--transcript",
+            "transcript.json",
+            "--name",
+            "rsi_video",
+            "--output",
+            "spec.json",
+        ]
+    )
+
+    assert (transcribe.command, transcribe.action) == ("strategy", "transcribe")
+    assert (compile_.command, compile_.action) == ("strategy", "compile")
+    assert (extract.command, extract.action) == ("strategy", "extract")
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,27 @@
+{
+  "dry_run": true,
+  "max_open_trades": 1,
+  "exchange": {
+    "name": "binance",
+    "key": "",
+    "secret": "",
+    "ccxt_config": {"options": {"defaultType": "spot"}},
+    "pair_whitelist": ["BTC/USDT"],
+    "pair_blacklist": []
+  },
+  "stake_currency": "USDT",
+  "stake_amount": 1000,
+  "tradable_balance_ratio": 0.99,
+  "fiat_display_currency": "EUR",
+  "dry_run_wallet": 10000,
+  "cancel_open_orders_on_exit": false,
+  "trading_mode": "spot",
+  "timeframe": "1h",
+  "dataformat_ohlcv": "json",
+  "dataformat_trades": "feather",
+  "pairlists": [{"method": "StaticPairList"}],
+  "entry_pricing": {"price_side": "same"},
+  "exit_pricing": {"price_side": "same"},
+  "unfilledtimeout": {"entry": 10, "exit": 10, "unit": "minutes"},
+  "internals": {"process_throttle_secs": 5}
+}
